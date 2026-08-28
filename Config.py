@@ -26,6 +26,8 @@ class Config:
         self.n_loads = int(n_buses * load_ratio)
         self.Y_bus, self.G, self.B = self.generate_Y_bus(avg_degree)
 
+        self.costs = np.random.uniform(1.0, 2.0, self.n_gens)
+
         self.load_P = np.random.uniform(0.1, 1.0, self.n_loads)
         self.load_Q = np.random.uniform(0.0, 0.4, self.n_loads)
 
@@ -70,3 +72,25 @@ class Config:
             Y_bus[j, j] += y
 
         return Y_bus, Y_bus.real, Y_bus.imag # type: ignore
+
+    def as_dict(self) -> dict:
+        return {
+            "n_buses": self.n_buses,
+            "n_gens": self.n_gens,
+            "n_loads": self.n_loads,
+            "Y_bus": self.Y_bus,
+            "G": self.G,
+            "B": self.B,
+            "costs": self.costs,
+            "load_P": self.load_P,
+            "load_Q": self.load_Q,
+            "V_max": self.V_max,
+            "V_min": self.V_min,
+            "P_max": self.P_max,
+            "P_min": self.P_min,
+            "Q_max": self.Q_max,
+            "Q_min": self.Q_min,
+        }
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
