@@ -2,7 +2,7 @@ import numpy as np
 from Config import Config
 import pickle
 
-def genConfigs():
+def generate_configs():
     """
     Generates a list of Config objects with different parameters for experiments
     Returns a list of Config objects
@@ -33,4 +33,4 @@ def genConfigs():
         pickle.dump({'exp1': exp1_configs, 'exp2': exp2_configs}, f)
 
 if __name__ == "__main__":
-    genConfigs()
+    generate_configs()

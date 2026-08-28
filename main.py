@@ -1,23 +1,32 @@
 import numpy as np
+import os
 import pickle
+from datetime import datetime
+from experiment_runner import experiment_runner
 
-def main():
+RESULTS_DIR = "results"
+
+def run_experiments():
     with open('configs.pkl', 'rb') as f:
         configs = pickle.load(f)
     configs_exp1 = configs['exp1']
     configs_exp2 = configs['exp2']
 
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp1_results_path = os.path.join(RESULTS_DIR, f"exp1_results_{run_timestamp}.pkl")
+
+    exp1_results = {}
     for key, config in configs_exp1.items():
-        # G max:
-        print(f"{key}: G max: {config.G.max()}, G min: {config.G.min()}")
+        print(f"Running experiment for {key}")
+        results = experiment_runner(config)
+        exp1_results[key] = results
 
-        # B max:
-        print(f"{key}: B max: {config.B.max()}, B min: {config.B.min()}")
+        with open(exp1_results_path, 'wb') as f:
+            pickle.dump(exp1_results, f)
 
-        # Max connectivity bus:
-        max_connectivity_bus = np.argmax(np.sum(config.Y_bus != 0, axis=1))
-        print(f"{key}: Max connectivity bus: {max_connectivity_bus}, Connectivity: {np.sum(config.Y_bus[max_connectivity_bus] != 0)}")
-
+def visualize_results(file_path: str):
+    raise NotImplementedError("Visualization function is not implemented yet. Please implement the function to visualize the results.")
 
 if __name__ == "__main__":
-    main()
+    run_experiments()
