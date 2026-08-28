@@ -3,89 +3,10 @@ import casadi as ca
 import cvxpy as cp
 import matplotlib.pyplot as plt
 from typing import Callable, Dict, Union, overload, cast
-from abc import ABC, abstractmethod\
+from ZDict import ZDict
+from Proxable import Proxable
+from admm import admm
 
-class ZDict:
-    """
-    A dict-like container mapping str -> np.ndarray that supports elementwise
-    arithmetic (+, -, *, unary -) and a norm()
-    """
-
-    def __init__(self, data: Dict[str, np.ndarray]):
-        self.data = dict(data)
-
-    @overload
-    def __getitem__(self, key: str) -> np.ndarray: ...
-    @overload
-    def __getitem__(self, key: Union[int, slice]) -> "ZDict": ...
-
-    def __getitem__(self, key):
-        """
-        Indexing by str returns the underlying array for that key. Indexing
-        by anything else (int, slice, ...) applies the same index to every
-        value and returns a ZDict of the results.
-        """
-        if isinstance(key, str):
-            return self.data[key]
-        return ZDict({k: v[key] for k, v in self.data.items()})
-
-    @overload
-    def __setitem__(self, key: str, value: np.ndarray) -> None: ...
-    @overload
-    def __setitem__(self, key: Union[int, slice], value: "ZDict") -> None: ...
-
-    def __setitem__(self, key, value) -> None:
-        """
-        Setting by str replaces the array for that key. Setting by anything
-        else assigns element-wise from another ZDict with matching keys.
-        """
-        if isinstance(key, str):
-            self.data[key] = value
-        else:
-            for k in self.data.keys():
-                self.data[k][key] = value[k]
-
-    def keys(self):
-        return self.data.keys()
-
-    def items(self):
-        return self.data.items()
-
-    def values(self):
-        return self.data.values()
-
-    def copy(self) -> "ZDict":
-        return ZDict({k: v.copy() for k, v in self.data.items()})
-
-    def zeroslike(self) -> "ZDict":
-        return ZDict({k: np.zeros_like(v) for k, v in self.data.items()})
-
-    def __add__(self, other: "ZDict") -> "ZDict":
-        return ZDict({k: self.data[k] + other.data[k] for k in self.data.keys()})
-
-    def __sub__(self, other: "ZDict") -> "ZDict":
-        return ZDict({k: self.data[k] - other.data[k] for k in self.data.keys()})
-
-    def __mul__(self, a: float) -> "ZDict":
-        return ZDict({k: a * v for k, v in self.data.items()})
-
-    def __rmul__(self, a: float) -> "ZDict":
-        return self.__mul__(a)
-
-    def __neg__(self) -> "ZDict":
-        return self.__mul__(-1)
-
-    def norm(self) -> float:
-        return float(np.linalg.norm(np.concatenate([v.ravel() for v in self.data.values()])))
-
-class Proxable(ABC):
-    """
-    Abstract class implementing the solution to
-    Prox_{rho, f}(z) = min_x f(x) + rho/2||x - z||^2
-    """
-    @abstractmethod
-    def prox(self, z: ZDict, rho: float) -> ZDict:
-        pass
 
 class ConstPowerLoad(Proxable):
     """
@@ -162,7 +83,7 @@ class Generator(Proxable):
 
         V_min = config["V_min"][bus_index]
         V_max = config["V_max"][bus_index]
-
+ 
         self.opti = ca.Opti()
         self.V_re = self.opti.variable()
         self.V_im = self.opti.variable()
@@ -309,59 +230,6 @@ class F(Proxable):
             raise ValueError("Optimization did not converge: one of the variables is None.")
 
         return ZDict({"v": self.V.value, "i": self.I.value, "s": self.S.value})
-
-def admm(f: Proxable,
-         g: Proxable,
-         z0: ZDict,
-         rho=lambda i, prev, r, s: 2.0,
-         threshold=1e-3,
-         max_iterations=1000,
-         callback=None):
-    """
-    Minimizes a constrained optimization problem using the Alternating Direction Method of Multipliers (ADMM).
-
-    Parameters
-    ----------
-    f : Proxable
-        The (possibly constrained) objective function to be minimized.
-    g : Proxable
-        The projection operator representing the constraints.
-    z0 : ZDict
-        The initial guess for the solution.
-    callback : callable, optional
-        Called as callback(iteration, x, z, u) at the end of each iteration.
-    """
-
-    # Initialize x0, z0, mu0
-    zs: list[ZDict] = [z0.copy()]
-    xs: list[ZDict] = [z0.zeroslike()]
-    us: list[ZDict] = [z0.zeroslike()]
-
-    rs = [(xs[-1] - zs[-1]).norm()]
-    ss = [(zs[-1] - zs[-1]).norm()]  # Initialize ss with zero since there's no previous z
-    rhos = [2.0]
-
-    for iteration in range(max_iterations-1):
-        new_rho = rho(iteration, rhos[-1], rs[-1], ss[-1])
-        rhos.append(new_rho)
-        # Rescale u when rho changes to keep λ = rho*u continuous
-        if new_rho != rhos[-2]:
-            us[-1] = us[-1] * (rhos[-2] / new_rho)
-
-        xs.append(f.prox(zs[-1] - us[-1], rhos[-1]))
-        zs.append(g.prox(xs[-1] + us[-1], rhos[-1]))
-        us.append(us[-1] + (xs[-1] - zs[-1]))
-
-        rs.append((xs[-1] - zs[-1]).norm())
-        ss.append(rhos[-1] * (zs[-1] - zs[-2]).norm())
-
-        if callback is not None:
-            callback(iteration, xs[-1], zs[-1], us[-1], rs[-1], ss[-1])
-
-        if rs[-1] < threshold and ss[-1] < threshold:
-            break
-
-    return xs, zs, us, rs, ss, rhos
 
 def make_config():
     config = {}
