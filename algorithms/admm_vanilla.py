@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from Config import Config
-from ZDict import ZDict
+from Trajectory import Trajectory
 from admm import admm
 from algorithms.base import SolveResult, ConvergenceHistory
 from algorithms.common import F, make_bus_behaviours, rho_heuristic, check_solution
@@ -15,10 +15,10 @@ def solve(config: Config) -> SolveResult:
     f = F(config_dict)
     g = make_bus_behaviours(config_dict)
 
-    z0 = ZDict({
-        "v": np.ones(n_buses, dtype=complex),
-        "i": np.zeros(n_buses, dtype=complex),
-        "s": np.zeros(n_buses, dtype=complex),
+    z0 = Trajectory({
+        "v": np.ones((1, n_buses), dtype=complex),
+        "i": np.zeros((1, n_buses), dtype=complex),
+        "s": np.zeros((1, n_buses), dtype=complex),
     })
 
     start = time.perf_counter()
@@ -29,7 +29,7 @@ def solve(config: Config) -> SolveResult:
 
     z = xs[-1]
     checks = check_solution(z, config_dict)
-    dispatch = np.real(z["s"])[:n_gens]
+    dispatch = np.real(z["s"])[0, :n_gens]
 
     return SolveResult(
         dispatch=dispatch,

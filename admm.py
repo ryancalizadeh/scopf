@@ -1,9 +1,9 @@
 from Proxable import Proxable
-from ZDict import ZDict
+from Trajectory import Trajectory
 
 def admm(f: Proxable,
          g: Proxable,
-         z0: ZDict,
+         z0: Trajectory,
          rho=lambda i, prev, r, s: 2.0,
          threshold=1e-3,
          max_iterations=1000,
@@ -17,16 +17,16 @@ def admm(f: Proxable,
         The (possibly constrained) objective function to be minimized.
     g : Proxable
         The projection operator representing the constraints.
-    z0 : ZDict
+    z0 : Trajectory
         The initial guess for the solution.
     callback : callable, optional
         Called as callback(iteration, x, z, u) at the end of each iteration.
     """
 
     # Initialize x0, z0, mu0
-    zs: list[ZDict] = [z0.copy()]
-    xs: list[ZDict] = [z0.zeroslike()]
-    us: list[ZDict] = [z0.zeroslike()]
+    zs: list[Trajectory] = [z0.copy()]
+    xs: list[Trajectory] = [z0.zeroslike()]
+    us: list[Trajectory] = [z0.zeroslike()]
 
     rs = [(xs[-1] - zs[-1]).norm()]
     ss = [(zs[-1] - zs[-1]).norm()]  # Initialize ss with zero since there's no previous z

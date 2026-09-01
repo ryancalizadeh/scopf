@@ -2,7 +2,7 @@ import numpy as np
 import casadi as ca
 import cvxpy as cp
 from typing import Dict, cast
-from ZDict import ZDict
+from Trajectory import Trajectory
 from Proxable import Proxable
 
 
@@ -50,10 +50,10 @@ class ConstPowerLoad(Proxable):
         opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes'}
         self.opti.solver('ipopt', opts)
 
-    def prox(self, z: ZDict, rho: float = 1.0) -> ZDict:
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
         ret = z.copy()
-        V0 = ret["v"][0]
-        I0 = ret["i"][0]
+        V0 = ret["v"][0, 0]
+        I0 = ret["i"][0, 0]
 
         self.opti.set_value(self.v0r, np.real(V0))
         self.opti.set_value(self.v0i, np.imag(V0))
@@ -62,9 +62,9 @@ class ConstPowerLoad(Proxable):
 
         sol = self.opti.solve()
 
-        ret["v"][0] = sol.value(self.V_re) + 1j * sol.value(self.V_im)
-        ret["i"][0] = sol.value(self.I_re) + 1j * sol.value(self.I_im)
-        ret["s"][0] = self.S
+        ret["v"][0, 0] = sol.value(self.V_re) + 1j * sol.value(self.V_im)
+        ret["i"][0, 0] = sol.value(self.I_re) + 1j * sol.value(self.I_im)
+        ret["s"][0, 0] = self.S
 
         return ret
 
@@ -107,11 +107,11 @@ class Generator(Proxable):
         opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes'}
         self.opti.solver('ipopt', opts)
 
-    def prox(self, z: ZDict, rho: float = 1.0) -> ZDict:
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
         ret = z.copy()
-        V0 = ret["v"][0]
-        I0 = ret["i"][0]
-        S = ret["s"][0]
+        V0 = ret["v"][0, 0]
+        I0 = ret["i"][0, 0]
+        S = ret["s"][0, 0]
 
         self.opti.set_value(self.v0r, np.real(V0))
         self.opti.set_value(self.v0i, np.imag(V0))
@@ -122,9 +122,9 @@ class Generator(Proxable):
 
         sol = self.opti.solve()
 
-        ret["v"][0] = sol.value(self.V_re) + 1j * sol.value(self.V_im)
-        ret["i"][0] = sol.value(self.I_re) + 1j * sol.value(self.I_im)
-        ret["s"][0] = sol.value(self.P) + 1j * sol.value(self.Q)
+        ret["v"][0, 0] = sol.value(self.V_re) + 1j * sol.value(self.V_im)
+        ret["i"][0, 0] = sol.value(self.I_re) + 1j * sol.value(self.I_im)
+        ret["s"][0, 0] = sol.value(self.P) + 1j * sol.value(self.Q)
 
         return ret
 
@@ -136,11 +136,11 @@ class BusBehaviours(Proxable):
     def __init__(self, behaviours: list[Proxable]):
         self.behaviours = behaviours
 
-    def prox(self, z: ZDict, rho: float = 1.0) -> ZDict:
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
         ret = z.copy()
         for i, behaviour in enumerate(self.behaviours):
-            ret_i = behaviour.prox(ret[i:i+1], rho)
-            ret[i] = ret_i[0]
+            ret_i = behaviour.prox(ret.at_bus[i], rho)
+            ret.at_bus[i] = ret_i
         return ret
 
 
@@ -211,14 +211,14 @@ class F(Proxable):
         self.problem = cp.Problem(cp.Minimize(objective), constraints)
         self._rho = rho
 
-    def prox(self, z: ZDict, rho: float = 1.0) -> ZDict:
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
         if self.problem is None or rho != self._rho:
             self._build_problem(rho)
         problem = cast(cp.Problem, self.problem)
 
-        self.V0.value = z["v"]
-        self.I0.value = z["i"]
-        self.S0.value = z["s"]
+        self.V0.value = z["v"][0]
+        self.I0.value = z["i"][0]
+        self.S0.value = z["s"][0]
 
         problem.solve()
 
@@ -228,7 +228,11 @@ class F(Proxable):
         if self.V.value is None or self.I.value is None or self.S.value is None:
             raise ValueError("Optimization did not converge: one of the variables is None.")
 
-        return ZDict({"v": self.V.value, "i": self.I.value, "s": self.S.value})
+        return Trajectory({
+            "v": self.V.value[np.newaxis, :],
+            "i": self.I.value[np.newaxis, :],
+            "s": self.S.value[np.newaxis, :],
+        })
 
 
 def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
@@ -251,7 +255,7 @@ def make_bus_behaviours(config: Dict) -> BusBehaviours:
     ])
 
 
-def check_solution(z: ZDict, config: Dict) -> Dict[str, float]:
+def check_solution(z: Trajectory, config: Dict) -> Dict[str, float]:
     """
     Evaluates a candidate solution z = (V, I, S) against the OPF problem
     described by config, returning the objective value along with the
@@ -267,9 +271,9 @@ def check_solution(z: ZDict, config: Dict) -> Dict[str, float]:
     Q_max = config["Q_max"]
     Q_min = config["Q_min"]
 
-    V = z["v"]
-    I = z["i"]
-    S = z["s"]
+    V = z["v"][0]
+    I = z["i"][0]
+    S = z["s"][0]
 
     P = np.real(S)
     Q = np.imag(S)
