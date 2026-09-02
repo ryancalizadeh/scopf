@@ -7,13 +7,13 @@ from algorithms.base import SolveResult, ConvergenceHistory
 from algorithms.common import F, make_bus_behaviours, rho_heuristic, check_solution
 
 
-def solve(config: Config) -> SolveResult:
+def solve(config: Config, parallel: bool = False) -> SolveResult:
     config_dict = config.as_dict()
     n_buses = config.n_buses
     n_gens = config.n_gens
 
     f = F(config_dict)
-    g = make_bus_behaviours(config_dict)
+    g = make_bus_behaviours(config_dict, parallel=parallel)
 
     z0 = Trajectory({
         "v": np.ones((1, n_buses), dtype=complex),

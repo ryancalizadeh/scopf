@@ -1,6 +1,7 @@
 import numpy as np
 import casadi as ca
 import cvxpy as cp
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, cast
 from Trajectory import Trajectory
 from Proxable import Proxable
@@ -144,6 +145,29 @@ class BusBehaviours(Proxable):
         return ret
 
 
+class BusBehavioursParallel(Proxable):
+    """
+    Same as BusBehaviours, but evaluates each bus's prox in parallel using a
+    thread pool. Each behaviour owns its own solver instance and only reads
+    a single-bus slice of z, so the per-bus prox calls are independent and
+    safe to run concurrently.
+    """
+    def __init__(self, behaviours: list[Proxable], max_workers: int | None = None):
+        self.behaviours = behaviours
+        self.max_workers = max_workers
+
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        ret = z.copy()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            results = list(executor.map(
+                lambda item: item[1].prox(z.at_bus[item[0]], rho),
+                enumerate(self.behaviours),
+            ))
+        for i, ret_i in enumerate(results):
+            ret.at_bus[i] = ret_i
+        return ret
+
+
 class F(Proxable):
     """
     A class implementing Prox_{rho, f}(z) = min_x f(x) + rho/2||x - z||^2 where:
@@ -246,13 +270,16 @@ def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
         return rho_prev
 
 
-def make_bus_behaviours(config: Dict) -> BusBehaviours:
+def make_bus_behaviours(config: Dict, parallel: bool = False) -> Proxable:
     n_buses = config["n_buses"]
     n_gens = config["n_gens"]
-    return BusBehaviours([
+    behaviours = [
         *(Generator(config, bus_index=i, gen_index=i) for i in range(n_gens)),
         *(ConstPowerLoad(config, bus_index=i, load_index=i - n_gens) for i in range(n_gens, n_buses)),
-    ])
+    ]
+    if parallel:
+        return BusBehavioursParallel(behaviours)
+    return BusBehaviours(behaviours)
 
 
 def check_solution(z: Trajectory, config: Dict) -> Dict[str, float]:

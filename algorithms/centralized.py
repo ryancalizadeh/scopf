@@ -67,7 +67,7 @@ def solve(config: Config) -> SolveResult:
 
     runtime = time.perf_counter() - start
 
-    dispatch = sol.value(P)[:n_gens]
+    dispatch = sol.value(P)[:n_gens] # type: ignore
     obj = float(np.sum(costs * dispatch ** 2))
 
     return SolveResult(
