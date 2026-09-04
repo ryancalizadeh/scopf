@@ -7,7 +7,7 @@ Index = Union[int, slice, list, np.ndarray]
 def _normalize(index: Index) -> Index:
     """
     Turns a bare int into a length-1 slice so that indexing along an axis
-    never drops that axis (arrays stay 2D: (horizon, n_buses)).
+    never drops that axis (arrays stay 2D: (horizon, width)).
     """
     if isinstance(index, (int, np.integer)):
         return slice(index, index + 1 if index != -1 else None)
@@ -45,15 +45,22 @@ class _AxisIndexer:
 class Trajectory:
     """
     A dict-like container mapping str -> np.ndarray of shape
-    (horizon, n_buses), representing a finite-horizon trajectory of
-    steady-state quantities (voltage, current, frequency, ...) at each bus.
+    (horizon, width), representing a finite-horizon trajectory of
+    steady-state quantities (voltage, current, frequency, ...).
+
+    Signal width varies by key: electrical signals (voltage, current, ...)
+    are indexed per-bus (width n_buses), while mechanical signals (rotor
+    angle, frequency, ...) exist only at generator buses (width n_gens).
+    Generator buses are assumed to be the first n_gens bus indices, so a
+    bus index/slice that stays within range is valid for both. All keys
+    must still share the same time horizon.
 
     Arrays may be real or complex independently per key (e.g. "v"/"i" as
     complex phasors, "freq"/"p_mech" as real signals) - dtype is tracked
     per-key by numpy, nothing extra is needed to support the mix.
 
     Three ways to access the underlying data:
-      - traj["v"]        -> raw (horizon, n_buses) array for that key
+      - traj["v"]        -> raw (horizon, width) array for that key
       - traj.at_time[t]   -> Trajectory sliced to time index/slice t (all buses)
       - traj.at_bus[i]    -> Trajectory sliced to bus index/slice i (full horizon)
     """
@@ -61,12 +68,17 @@ class Trajectory:
     def __init__(self, data: Dict[str, np.ndarray]):
         self.data = {k: np.asarray(v) for k, v in data.items()}
 
-        shapes = {k: v.shape for k, v in self.data.items()}
-        if len(set(shapes.values())) > 1:
-            raise ValueError(f"All keys must share the same (horizon, n_buses) shape, got {shapes}")
         for k, v in self.data.items():
             if v.ndim != 2:
-                raise ValueError(f"Trajectory arrays must be 2D (horizon, n_buses); key {k!r} has shape {v.shape}")
+                raise ValueError(f"Trajectory arrays must be 2D (horizon, width); key {k!r} has shape {v.shape}")
+
+        horizons = {v.shape[0] for v in self.data.values()}
+        if len(horizons) > 1:
+            shapes = {k: v.shape for k, v in self.data.items()}
+            raise ValueError(f"All keys must share the same time horizon, got {shapes}")
+
+    def width(self, key: str) -> int:
+        return self.data[key].shape[1]
 
     @property
     def horizon(self) -> int:
@@ -74,7 +86,7 @@ class Trajectory:
 
     @property
     def n_buses(self) -> int:
-        return next(iter(self.data.values())).shape[1]
+        return max(v.shape[1] for v in self.data.values())
 
     @property
     def at_time(self) -> _AxisIndexer:
@@ -89,9 +101,9 @@ class Trajectory:
 
     def __setitem__(self, key: str, value: np.ndarray) -> None:
         value = np.asarray(value)
-        if value.shape != (self.horizon, self.n_buses):
+        if value.ndim != 2 or value.shape[0] != self.horizon:
             raise ValueError(
-                f"Value for key {key!r} must have shape {(self.horizon, self.n_buses)}, got {value.shape}"
+                f"Value for key {key!r} must have shape (horizon={self.horizon}, width), got {value.shape}"
             )
         self.data[key] = value
 
@@ -117,8 +129,11 @@ class Trajectory:
             if self.horizon != other.horizon:
                 raise ValueError(f"Trajectories have mismatched horizons: {self.horizon} vs {other.horizon}")
         if axis is None or axis == 0:
-            if self.n_buses != other.n_buses:
-                raise ValueError(f"Trajectories have mismatched bus counts: {self.n_buses} vs {other.n_buses}")
+            mismatched = {
+                k: (self.width(k), other.width(k)) for k in self.data if self.width(k) != other.width(k)
+            }
+            if mismatched:
+                raise ValueError(f"Trajectories have mismatched widths for keys: {mismatched}")
 
     def __add__(self, other: "Trajectory") -> "Trajectory":
         self._check_compatible(other)

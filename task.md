@@ -6,4 +6,7 @@
     3) time domain contingency solutions, for admm vs centralized, showing they look very similar and constraints are respected
 
 # Sub goal
-- flesh out main logic
+1) fix up centralized to reflect the new problem (for now, lets do TSC-OPF + partial relaxation. FSC-OPF can come later).
+2) Figure out exact splitting (what goes in f and g)
+3) implement f
+4) implement generator prox, constpowerload prox, and empty prox
