@@ -4,6 +4,9 @@ class Config:
     """
     This data class contains all the configuration parameters for an experiment
     """
+    T: float
+    dt: float
+    N: int
     n_buses: int
     n_gens: int
     n_loads: int
@@ -19,43 +22,65 @@ class Config:
     P_min: np.ndarray
     Q_max: np.ndarray
     Q_min: np.ndarray
+    line_flow_limits: float
+    omega_s = 2 * np.pi * 60  # Synchronous speed in rad/s
+    D: np.ndarray
+    M: np.ndarray
+    Xd: np.ndarray
+    load_step_factor: float
 
-    def __init__(self, n_buses: int, gen_ratio: float, load_ratio: float, avg_degree: float):
+    def __init__(self, n_buses: int, gen_ratio: float, load_ratio: float, avg_degree: float,
+                 T: float = 2.0, dt: float = 0.1, load_step_factor: float = 1.2):
+        rng = np.random.default_rng(seed=42)  # For reproducibility
+        self.T = T
+        self.dt = dt
+        self.N = int(T / dt)
+        # Disturbance for the transient stability problem: every load is scaled
+        # by this factor for all time steps n >= 1 (n = 0 is the pre-disturbance
+        # steady state).
+        self.load_step_factor = load_step_factor
         self.n_buses = n_buses
         self.n_gens = int(n_buses * gen_ratio)
         self.n_loads = int(n_buses * load_ratio)
         self.Y_bus, self.G, self.B = self.generate_Y_bus(avg_degree)
 
-        self.costs = np.random.uniform(1.0, 2.0, self.n_gens)
+        self.D = rng.uniform(0.01, 0.05, self.n_gens)  # Damping coefficients
+        self.M = rng.uniform(0.1, 0.5, self.n_gens)  # Inertia constants
+        self.Xd = rng.uniform(0.1, 0.3, self.n_gens)  # Direct-axis reactances
 
-        self.load_P = np.random.uniform(0.1, 1.0, self.n_loads)
-        self.load_Q = np.random.uniform(0.0, 0.4, self.n_loads)
+        self.costs = rng.uniform(1.0, 2.0, self.n_gens)
+
+        self.load_P = rng.uniform(0.1, 1.0, self.n_loads)
+        self.load_Q = rng.uniform(0.0, 0.4, self.n_loads)
 
         self.V_max = np.full(n_buses, 1.05)
         self.V_min = np.full(n_buses, 0.95)
 
         self.P_min = np.zeros(self.n_gens)
-        self.P_max = np.random.uniform(1.0, 2.0, self.n_gens)
-        self.Q_max = np.random.uniform(0.5, 1.0, self.n_gens)
+        self.P_max = rng.uniform(1.0, 2.0, self.n_gens)
+        self.Q_max = rng.uniform(0.5, 1.0, self.n_gens)
         self.Q_min = -self.Q_max
+
+        self.line_flow_limits = 1.0  # This can be adjusted as needed
 
     def generate_Y_bus(self, avg_degree: float):
         # TODO For now this is fine. In the future, I should follow the methodology of Birchfield 2017
+        rng = np.random.default_rng(seed=42)  # For reproducibility
         n = self.n_buses
         edges = set()
 
         # random spanning tree to guarantee connectivity
-        order = np.random.permutation(n)
+        order = rng.permutation(n)
         for k in range(1, n):
             i = order[k]
-            j = order[np.random.randint(0, k)]
+            j = order[rng.integers(0, k)]
             edges.add((min(i, j), max(i, j)))
 
         # add extra random edges to approximate the target average degree
         all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
         target_edges = int(round(avg_degree * n / 2))
         remaining = [pair for pair in all_pairs if pair not in edges]
-        np.random.shuffle(remaining)
+        rng.shuffle(remaining)
         for pair in remaining:
             if len(edges) >= target_edges:
                 break
@@ -63,8 +88,8 @@ class Config:
 
         Y_bus = np.zeros((n, n), dtype=complex)
         for i, j in edges:
-            R = np.random.uniform(0.01, 0.03)
-            X = np.random.uniform(0.1, 0.2)
+            R = rng.uniform(0.01, 0.03)
+            X = rng.uniform(0.1, 0.2)
             y = 1 / (R + 1j * X)
             Y_bus[i, j] -= y
             Y_bus[j, i] -= y
@@ -72,25 +97,6 @@ class Config:
             Y_bus[j, j] += y
 
         return Y_bus, Y_bus.real, Y_bus.imag # type: ignore
-
-    def as_dict(self) -> dict:
-        return {
-            "n_buses": self.n_buses,
-            "n_gens": self.n_gens,
-            "n_loads": self.n_loads,
-            "Y_bus": self.Y_bus,
-            "G": self.G,
-            "B": self.B,
-            "costs": self.costs,
-            "load_P": self.load_P,
-            "load_Q": self.load_Q,
-            "V_max": self.V_max,
-            "V_min": self.V_min,
-            "P_max": self.P_max,
-            "P_min": self.P_min,
-            "Q_max": self.Q_max,
-            "Q_min": self.Q_min,
-        }
 
     def __getitem__(self, key: str):
         return getattr(self, key)

@@ -8,12 +8,11 @@ from algorithms.common import F, make_bus_behaviours, rho_heuristic, check_solut
 
 
 def solve(config: Config, parallel: bool = False) -> SolveResult:
-    config_dict = config.as_dict()
     n_buses = config.n_buses
     n_gens = config.n_gens
 
-    f = F(config_dict)
-    g = make_bus_behaviours(config_dict, parallel=parallel)
+    f = F(config)
+    g = make_bus_behaviours(config, parallel=parallel)
 
     z0 = Trajectory({
         "v": np.ones((1, n_buses), dtype=complex),
@@ -28,7 +27,7 @@ def solve(config: Config, parallel: bool = False) -> SolveResult:
     runtime = time.perf_counter() - start
 
     z = xs[-1]
-    checks = check_solution(z, config_dict)
+    checks = check_solution(z, config)
     dispatch = np.real(z["s"])[0, :n_gens]
 
     return SolveResult(

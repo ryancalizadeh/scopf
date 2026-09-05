@@ -1,8 +1,14 @@
 import numpy as np
 import casadi as ca
 import cvxpy as cp
+from scipy.linalg import expm
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, cast
+from typing import Any, Dict, cast
+from Config import Config
+
+# The generator DAE helpers accept plain numbers as well as casadi symbols
+# (MX / SX / DM); the arithmetic inside them is +, *, ca.cos and ca.sin only.
+Scalar = Any
 from Trajectory import Trajectory
 from Proxable import Proxable
 
@@ -12,7 +18,7 @@ class ConstPowerLoad(Proxable):
     A class implementing projections onto the behaviour of a constant power load
     """
 
-    def __init__(self, config: Dict, bus_index: int, load_index: int, max_iter=20, tol=1e-5):
+    def __init__(self, config: Config, bus_index: int, load_index: int, max_iter=20, tol=1e-5):
         self.config = config
         self.bus_index = bus_index
         self.load_index = load_index
@@ -75,7 +81,7 @@ class Generator(Proxable):
     A class implementing projections onto the behaviour of a flexible generator
     """
 
-    def __init__(self, config: Dict, bus_index: int, gen_index: int):
+    def __init__(self, config: Config, bus_index: int, gen_index: int):
         self.config = config
         self.bus_index = bus_index
         self.gen_index = gen_index
@@ -191,7 +197,7 @@ class F(Proxable):
                 Q_{min, i} < Q_i < Q_{max, i}
     """
 
-    def __init__(self, config):
+    def __init__(self, config: Config):
         self.config = config
 
         self.n_buses = config["n_buses"]
@@ -270,7 +276,7 @@ def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
         return rho_prev
 
 
-def make_bus_behaviours(config: Dict, parallel: bool = False) -> Proxable:
+def make_bus_behaviours(config: Config, parallel: bool = False) -> Proxable:
     n_buses = config["n_buses"]
     n_gens = config["n_gens"]
     behaviours = [
@@ -282,7 +288,7 @@ def make_bus_behaviours(config: Dict, parallel: bool = False) -> Proxable:
     return BusBehaviours(behaviours)
 
 
-def check_solution(z: Trajectory, config: Dict) -> Dict[str, float]:
+def check_solution(z: Trajectory, config: Config) -> Dict[str, float]:
     """
     Evaluates a candidate solution z = (V, I, S) against the OPF problem
     described by config, returning the objective value along with the
@@ -331,3 +337,153 @@ def check_solution(z: Trajectory, config: Dict) -> Dict[str, float]:
         "voltage_residual": voltage_residual,
         "generation_residual": generation_residual,
     }
+
+
+# ---------------------------------------------------------------------------
+# Generator DAE model (classical model: constant |E| behind transient reactance)
+#
+# Dynamic state   x = [delta, omega]      (rotor angle [rad], absolute speed [rad/s])
+# Input           u = [P_0, P_e]          (mechanical power, electrical power)
+#
+# Continuous time:  x_dot = A x + B_u u + c
+#   delta_dot = omega - omega_s
+#   omega_dot = (P_0 - P_e - D (omega - omega_s)) / M
+#
+# Algebraic (network interface, I = injection into the network):
+#   E e^{j delta} = V + j Xd I
+#
+# The differential equations are linear in (x, u), so they are discretized
+# exactly (zero-order hold on u over each step of length dt):
+#   x_{n+1} = A_d x_n + B_d u_n + c_d
+# Every helper below builds scalar expressions with +/* only (and ca.cos/ca.sin
+# for the algebraic part), so they work with floats and casadi symbols alike.
+# ---------------------------------------------------------------------------
+
+
+def gen_continuous_matrices(config: Config, gen_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Continuous-time swing dynamics of generator gen_idx in the form
+        x_dot = A x + B_u u + c,   x = [delta, omega],  u = [P_0, P_e]
+    Returns numeric (A (2x2), B_u (2x2), c (2,)).
+    """
+    D = float(config.D[gen_idx])
+    M = float(config.M[gen_idx])
+    omega_s = float(config.omega_s)
+    A = np.array([[0.0, 1.0], [0.0, -D / M]])
+    B_u = np.array([[0.0, 0.0], [1.0 / M, -1.0 / M]])
+    c = np.array([-omega_s, D * omega_s / M])
+    return A, B_u, c
+
+
+def gen_discrete_dynamics(config: Config, gen_idx: int, dt: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Exact zero-order-hold discretization of gen_continuous_matrices with step dt
+    (defaults to config.dt):
+        x_{n+1} = A_d x_n + B_d u_n + c_d
+    with A_d = expm(A dt), Phi = int_0^dt expm(A s) ds, B_d = Phi B_u, c_d = Phi c.
+    A_d and Phi are read off a single matrix exponential of the augmented
+    matrix [[A dt, I dt], [0, 0]].
+    """
+    if dt is None:
+        dt = config.dt
+    A, B_u, c = gen_continuous_matrices(config, gen_idx)
+    aug = np.zeros((4, 4))
+    aug[:2, :2] = A * dt
+    aug[:2, 2:] = np.eye(2) * dt
+    aug_d = expm(aug)
+    A_d = aug_d[:2, :2]
+    Phi = aug_d[:2, 2:]
+    return A_d, Phi @ B_u, Phi @ c
+
+
+def gen_diff_eqs(
+        config: Config,
+        gen_idx: int,
+        V_re: Scalar,
+        V_im: Scalar,
+        I_re: Scalar,
+        I_im: Scalar,
+        S_re: Scalar,
+        S_im: Scalar,
+        delta: Scalar,
+        omega: Scalar,
+        P_0: Scalar
+    ) -> Dict[str, Scalar]:
+    """
+    Computes the differential equations for a generator at a given index.
+    Returns the derivatives of the dynamic states (delta, omega) i.e. computes
+    x_dot = f(x, y, u)
+    """
+    A, B_u, c = gen_continuous_matrices(config, gen_idx)
+    A, B_u, c = A.tolist(), B_u.tolist(), c.tolist()
+
+    return {
+        "delta_dot": A[0][0] * delta + A[0][1] * omega + B_u[0][0] * P_0 + B_u[0][1] * S_re + c[0],
+        "omega_dot": A[1][0] * delta + A[1][1] * omega + B_u[1][0] * P_0 + B_u[1][1] * S_re + c[1],
+    }
+
+
+def gen_discrete_step(
+        config: Config,
+        gen_idx: int,
+        delta: Scalar,
+        omega: Scalar,
+        S_re: Scalar,
+        P_0: Scalar,
+        dt: float | None = None
+    ) -> Dict[str, Scalar]:
+    """
+    One exact (zero-order hold) step of the generator swing dynamics:
+        [delta_next, omega_next] = A_d [delta, omega] + B_d [P_0, S_re] + c_d
+    where S_re is the electrical power held over the step and P_0 the
+    mechanical power. Works with floats and casadi symbols.
+    """
+    A_d, B_d, c_d = gen_discrete_dynamics(config, gen_idx, dt)
+    A_d, B_d, c_d = A_d.tolist(), B_d.tolist(), c_d.tolist()
+
+    return {
+        "delta_next": A_d[0][0] * delta + A_d[0][1] * omega + B_d[0][0] * P_0 + B_d[0][1] * S_re + c_d[0],
+        "omega_next": A_d[1][0] * delta + A_d[1][1] * omega + B_d[1][0] * P_0 + B_d[1][1] * S_re + c_d[1],
+    }
+
+
+def gen_alg_eqs(
+        config: Config,
+        gen_idx: int,
+        V_re: Scalar,
+        V_im: Scalar,
+        I_re: Scalar,
+        I_im: Scalar,
+        S_re: Scalar,
+        S_im: Scalar,
+        delta: Scalar,
+        omega: Scalar,
+        E: Scalar,
+        P_0: Scalar
+    ) -> Dict[str, Scalar]:
+    """
+    Computes the algebraic equations for a generator at a given index.
+    Returns the residuals of the algebraic equations (power balance, etc.) i.e. computes
+    r = g(x, y, u)
+
+    E is the (constant) magnitude of the voltage behind the transient reactance.
+    """
+    Xd = float(config.Xd[gen_idx])
+    # Rotor equation: E e^{j delta} = V + j Xd I
+    r_re = E * ca.cos(delta) - V_re + Xd * I_im
+    r_im = E * ca.sin(delta) - V_im - Xd * I_re
+
+    return {
+        "r_re": r_re,
+        "r_im": r_im,
+    }
+
+
+def gen_coi_angle(config: Config, delta):
+    """
+    Centre-of-inertia rotor angle delta_coi = sum_i M_i delta_i / sum_i M_i.
+    delta may be a numpy vector or a casadi column of length n_gens.
+    """
+    M = np.asarray(config.M, dtype=float)
+    M_total = float(M.sum())
+    return sum(float(M[i]) * delta[i] for i in range(len(M))) / M_total
