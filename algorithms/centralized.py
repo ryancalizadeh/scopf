@@ -4,11 +4,7 @@ import casadi as ca
 from Config import Config
 from Trajectory import Trajectory
 from algorithms.base import SolveResult
-from algorithms.common import gen_alg_eqs, gen_discrete_step, gen_coi_angle
-
-
-# Transient stability limit on the rotor angle relative to the centre of inertia
-DELTA_COI_MAX = np.deg2rad(100.0)
+from algorithms.common import gen_alg_eqs, gen_discrete_step, gen_coi_angle, DELTA_COI_MAX
 
 
 def solve(config: Config) -> SolveResult:

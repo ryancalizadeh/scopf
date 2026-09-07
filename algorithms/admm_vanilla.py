@@ -10,14 +10,19 @@ from algorithms.common import F, make_bus_behaviours, rho_heuristic, check_solut
 def solve(config: Config, parallel: bool = False) -> SolveResult:
     n_buses = config.n_buses
     n_gens = config.n_gens
+    N = config.N
 
     f = F(config)
     g = make_bus_behaviours(config, parallel=parallel)
 
+    # Flat start over the whole horizon: unit voltages, no current, rotor
+    # angles at zero and every machine at synchronous speed.
     z0 = Trajectory({
-        "v": np.ones((1, n_buses), dtype=complex),
-        "i": np.zeros((1, n_buses), dtype=complex),
-        "s": np.zeros((1, n_buses), dtype=complex),
+        "v": np.ones((N, n_buses), dtype=complex),
+        "i": np.zeros((N, n_buses), dtype=complex),
+        "s": np.zeros((N, n_buses), dtype=complex),
+        "delta": np.zeros((N, n_gens)),
+        "omega": np.full((N, n_gens), float(config.omega_s)),
     })
 
     start = time.perf_counter()
@@ -37,4 +42,5 @@ def solve(config: Config, parallel: bool = False) -> SolveResult:
         p_residual=checks["network_residual"],
         s_residual=checks["power_balance_residual"],
         convergence=ConvergenceHistory(r=rs, s=ss, rho=rhos),
+        trajectory=z,
     )

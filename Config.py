@@ -28,9 +28,11 @@ class Config:
     M: np.ndarray
     Xd: np.ndarray
     load_step_factor: float
+    load_fraction: float
 
     def __init__(self, n_buses: int, gen_ratio: float, load_ratio: float, avg_degree: float,
-                 T: float = 2.0, dt: float = 0.1, load_step_factor: float = 1.2):
+                 T: float = 2.0, dt: float = 0.1, load_step_factor: float = 1.2,
+                 load_fraction: float = 0.3):
         rng = np.random.default_rng(seed=42)  # For reproducibility
         self.T = T
         self.dt = dt
@@ -53,13 +55,23 @@ class Config:
         self.load_P = rng.uniform(0.1, 1.0, self.n_loads)
         self.load_Q = rng.uniform(0.0, 0.4, self.n_loads)
 
-        self.V_max = np.full(n_buses, 1.05)
-        self.V_min = np.full(n_buses, 0.95)
+        self.V_max = np.full(n_buses, 1.15)
+        self.V_min = np.full(n_buses, 0.85)
 
         self.P_min = np.zeros(self.n_gens)
         self.P_max = rng.uniform(1.0, 2.0, self.n_gens)
         self.Q_max = rng.uniform(0.5, 1.0, self.n_gens)
         self.Q_min = -self.Q_max
+
+        # The raw random loads generally exceed the generation capacity (and the
+        # reactive losses on the random tree-like network exhaust the Q limits),
+        # which makes the OPF infeasible. Rescale the loads so that the total
+        # real load is load_fraction of the total P_max (reactive loads scaled
+        # by the same factor); 0.3 keeps the static OPF feasible up to 135 buses.
+        self.load_fraction = load_fraction
+        load_scale = load_fraction * self.P_max.sum() / self.load_P.sum()
+        self.load_P = self.load_P * load_scale
+        self.load_Q = self.load_Q * load_scale
 
         self.line_flow_limits = 1.0  # This can be adjusted as needed
 
@@ -88,8 +100,10 @@ class Config:
 
         Y_bus = np.zeros((n, n), dtype=complex)
         for i, j in edges:
-            R = rng.uniform(0.01, 0.03)
-            X = rng.uniform(0.1, 0.2)
+            # Line impedances kept modest: with X ~ 0.1-0.2 p.u. on a tree-like
+            # topology the reactive losses exceed the generators' Q limits.
+            R = rng.uniform(0.003, 0.01)
+            X = rng.uniform(0.03, 0.07)
             y = 1 / (R + 1j * X)
             Y_bus[i, j] -= y
             Y_bus[j, i] -= y
