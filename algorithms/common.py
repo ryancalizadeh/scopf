@@ -144,13 +144,14 @@ class ConstPowerLoad(Proxable):
 
 class Generator(Proxable):
     """
-    The behaviour of the generator is defined as:
+    The behaviour of the generator is defined as (omega(t) is the rotor speed
+    deviation from synchronous speed, omega_abs(t) - omega_s, in rad/s):
     B = {V(t), I(t), S(t)=P(t)+jQ(t), delta(t), omega(t) |
         S(t) = V(t) * conj(I(t)),
-        delta_dot(t) = omega(t) - omega_s,
-        omega_dot(t) = (P(0) - P(t) - D (omega(t) - omega_s)) / M,
+        delta_dot(t) = omega(t),
+        omega_dot(t) = (P(0) - P(t) - D omega(t)) / M,
         E e^{j delta(t)} = V(t) + j Xd I(t),
-        omega(0) = omega_s,
+        omega(0) = 0,
         }
     The DAE model is discretized using exact zero-order hold (ZOH) discretization (gen_discrete_step),
     the mechanical power is the pre-disturbance dispatch P(0), and E >= 0 is a constant internal to the
@@ -167,7 +168,6 @@ class Generator(Proxable):
         self.gen_index = gen_index
         N = config.N
         self.N = N
-        self.omega_s = float(config.omega_s)
 
         V_min = float(config.V_min[bus_index])
         V_max = float(config.V_max[bus_index])
@@ -218,8 +218,8 @@ class Generator(Proxable):
             opti.subject_to(self.delta[n + 1] == step["delta_next"])
             opti.subject_to(self.omega[n + 1] == step["omega_next"])
 
-        # Pre-disturbance steady state
-        opti.subject_to(self.omega[0] == self.omega_s)
+        # Pre-disturbance steady state: zero speed deviation
+        opti.subject_to(self.omega[0] == 0)
         opti.subject_to(self.E_var >= 0)
 
         V_sq0 = self.V_re[0]**2 + self.V_im[0]**2
@@ -309,7 +309,8 @@ class F(Proxable):
         |I_{kl}(0)| <= I_{kl}^{max} for all lines (k, l),
         |delta_i(t) - delta_coi(t)| <= 100 deg for all t,
     }
-    omega is unconstrained by f, so its prox is the identity and it bypasses the solver.
+    omega (the rotor speed deviation omega_abs - omega_s) is unconstrained by f, so its prox is the
+    identity and it bypasses the solver.
 
     f is convex (quadratic cost, linear network / limit constraints, second-order-cone line
     limits) and its proximal operator is computed with cvxpy. The problem is built once in
@@ -523,6 +524,12 @@ class BusBehavioursParallel(Proxable):
 
 
 def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
+    """
+    Residual-balancing heuristic. Known not to work for this nonconvex
+    splitting (it shrinks rho once the dual residual dominates and the
+    iteration falls into a limit cycle); kept for reference only. Prefer
+    rho_geometric or a fixed rho.
+    """
     if rho_prev == 0:
         return 2.0
     elif np.linalg.norm(r) > mu * np.linalg.norm(s):
@@ -531,6 +538,16 @@ def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
         return rho_prev / tau
     else:
         return rho_prev
+
+
+def rho_geometric(rho_0: float = 2.0, growth: float = 1.003, rho_max: float = 100.0):
+    """
+    Returns a rho schedule for admm.admm: rho_k = min(rho_0 * growth**k, rho_max),
+    i.e. a geometric ramp from rho_0 up to rho_max, independent of the residuals.
+    """
+    def schedule(iteration, rho_prev, r, s):
+        return float(min(rho_0 * growth ** iteration, rho_max))
+    return schedule
 
 
 def make_bus_behaviours(config: Config, parallel: bool = False) -> Proxable:
@@ -602,12 +619,16 @@ def check_solution(z: Trajectory, config: Config) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 # Generator DAE model (classical model: constant |E| behind transient reactance)
 #
-# Dynamic state   x = [delta, omega]      (rotor angle [rad], absolute speed [rad/s])
+# Dynamic state   x = [delta, omega]      (rotor angle [rad], speed deviation
+#                                          omega = omega_abs - omega_s [rad/s])
 # Input           u = [P_0, P_e]          (mechanical power, electrical power)
 #
-# Continuous time:  x_dot = A x + B_u u + c
-#   delta_dot = omega - omega_s
-#   omega_dot = (P_0 - P_e - D (omega - omega_s)) / M
+# Continuous time:  x_dot = A x + B_u u + c      (c = 0 for the deviation state;
+#                                                 kept so the helpers stay general)
+#   delta_dot = omega
+#   omega_dot = (P_0 - P_e - D omega) / M
+# Using the deviation keeps every trajectory signal O(1) and makes the
+# synchronous steady state x = 0 (omega_s never enters the equations).
 #
 # Algebraic (network interface, I = injection into the network):
 #   E e^{j delta} = V + j Xd I
@@ -624,14 +645,14 @@ def gen_continuous_matrices(config: Config, gen_idx: int) -> tuple[np.ndarray, n
     """
     Continuous-time swing dynamics of generator gen_idx in the form
         x_dot = A x + B_u u + c,   x = [delta, omega],  u = [P_0, P_e]
+    with omega the speed deviation from omega_s, so c = 0.
     Returns numeric (A (2x2), B_u (2x2), c (2,)).
     """
     D = float(config.D[gen_idx])
     M = float(config.M[gen_idx])
-    omega_s = float(config.omega_s)
     A = np.array([[0.0, 1.0], [0.0, -D / M]])
     B_u = np.array([[0.0, 0.0], [1.0 / M, -1.0 / M]])
-    c = np.array([-omega_s, D * omega_s / M])
+    c = np.zeros(2)
     return A, B_u, c
 
 
@@ -640,9 +661,9 @@ def gen_discrete_dynamics(config: Config, gen_idx: int, dt: float | None = None)
     Exact zero-order-hold discretization of gen_continuous_matrices with step dt
     (defaults to config.dt):
         x_{n+1} = A_d x_n + B_d u_n + c_d
-    with A_d = expm(A dt), Phi = int_0^dt expm(A s) ds, B_d = Phi B_u, c_d = Phi c.
-    A_d and Phi are read off a single matrix exponential of the augmented
-    matrix [[A dt, I dt], [0, 0]].
+    with A_d = expm(A dt), Phi = int_0^dt expm(A s) ds, B_d = Phi B_u, c_d = Phi c
+    (c_d = 0 for the speed-deviation state). A_d and Phi are read off a single
+    matrix exponential of the augmented matrix [[A dt, I dt], [0, 0]].
     """
     if dt is None:
         dt = config.dt
@@ -672,7 +693,7 @@ def gen_diff_eqs(
     """
     Computes the differential equations for a generator at a given index.
     Returns the derivatives of the dynamic states (delta, omega) i.e. computes
-    x_dot = f(x, y, u)
+    x_dot = f(x, y, u). omega is the speed deviation omega_abs - omega_s [rad/s].
     """
     A, B_u, c = gen_continuous_matrices(config, gen_idx)
     A, B_u, c = A.tolist(), B_u.tolist(), c.tolist()
@@ -695,8 +716,9 @@ def gen_discrete_step(
     """
     One exact (zero-order hold) step of the generator swing dynamics:
         [delta_next, omega_next] = A_d [delta, omega] + B_d [P_0, S_re] + c_d
-    where S_re is the electrical power held over the step and P_0 the
-    mechanical power. Works with floats and casadi symbols.
+    where S_re is the electrical power held over the step, P_0 the mechanical
+    power and omega the speed deviation omega_abs - omega_s [rad/s]. Works with
+    floats and casadi symbols.
     """
     A_d, B_d, c_d = gen_discrete_dynamics(config, gen_idx, dt)
     A_d, B_d, c_d = A_d.tolist(), B_d.tolist(), c_d.tolist()

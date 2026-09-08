@@ -51,6 +51,8 @@ class Trajectory:
     Signal width varies by key: electrical signals (voltage, current, ...)
     are indexed per-bus (width n_buses), while mechanical signals (rotor
     angle, frequency, ...) exist only at generator buses (width n_gens).
+    By convention the "omega" key holds the rotor speed deviation from
+    synchronous speed (omega_abs - omega_s, rad/s), not the absolute speed.
     Generator buses are assumed to be the first n_gens bus indices, so a
     bus index/slice that stays within range is valid for both. All keys
     must still share the same time horizon.

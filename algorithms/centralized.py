@@ -17,6 +17,9 @@ def solve(config: Config) -> SolveResult:
     evolves according to the classical generator model (see algorithms.common),
     discretized exactly with a zero-order hold. The dispatch is required to
     keep |delta_i - delta_coi| <= 100 deg over the whole horizon.
+
+    The "omega" variable/trajectory key is the rotor speed deviation from
+    synchronous speed (omega_abs - omega_s, rad/s), so the steady state is 0.
     """
     N = config.N
     G = config.G
@@ -33,7 +36,6 @@ def solve(config: Config) -> SolveResult:
     P_min = config.P_min
     Q_max = config.Q_max
     Q_min = config.Q_min
-    omega_s = config.omega_s
     load_step_factor = config.load_step_factor
 
     start = time.perf_counter()
@@ -99,9 +101,10 @@ def solve(config: Config) -> SolveResult:
             opti.subject_to(delta[i, n + 1] == step["delta_next"])
             opti.subject_to(omega[i, n + 1] == step["omega_next"])
 
-    # Pre-disturbance steady state (delta[i, 0] follows from the algebraic equations)
+    # Pre-disturbance steady state: zero speed deviation (delta[i, 0] follows
+    # from the algebraic equations)
     for i in range(n_gens):
-        opti.subject_to(omega[i, 0] == omega_s)
+        opti.subject_to(omega[i, 0] == 0)
         opti.subject_to(E[i] >= 0)
 
     # Reference (slack) bus angle: only for the steady state; afterwards the
@@ -135,7 +138,7 @@ def solve(config: Config) -> SolveResult:
     opti.set_initial(V_re, np.ones((n_buses, N)))
     opti.set_initial(V_im, np.zeros((n_buses, N)))
     opti.set_initial(delta, np.zeros((n_gens, N)))
-    opti.set_initial(omega, np.full((n_gens, N), omega_s))
+    opti.set_initial(omega, np.zeros((n_gens, N)))
     opti.set_initial(E, np.ones(n_gens))
 
     opti.solver('ipopt', {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes'})

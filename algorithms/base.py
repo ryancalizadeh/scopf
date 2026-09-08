@@ -20,5 +20,6 @@ class SolveResult:
     s_residual: Optional[float]
     convergence: Optional[ConvergenceHistory] = None
     # Full solved time-domain trajectory (keys "v", "i", "s", "delta", "omega",
-    # "E"), when the algorithm provides one.
+    # "E"), when the algorithm provides one. "omega" is the rotor speed
+    # deviation from synchronous speed (rad/s).
     trajectory: Optional[Trajectory] = None
