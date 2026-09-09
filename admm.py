@@ -1,5 +1,8 @@
+import logging
 from Proxable import Proxable
 from Trajectory import Trajectory
+
+logger = logging.getLogger(__name__)
 
 def admm(f: Proxable,
          g: Proxable,
@@ -45,6 +48,9 @@ def admm(f: Proxable,
 
         rs.append((xs[-1] - zs[-1]).norm())
         ss.append(rhos[-1] * (zs[-1] - zs[-2]).norm())
+
+        if iteration % 10 == 0:
+            logger.debug(f"ADMM iteration {iteration} / {max_iterations-1}: r={rs[-1]:.6g}, s={ss[-1]:.6g}, rho={rhos[-1]:.6g}")
 
         if callback is not None:
             callback(iteration, xs[-1], zs[-1], us[-1], rs[-1], ss[-1])

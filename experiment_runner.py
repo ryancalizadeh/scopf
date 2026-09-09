@@ -3,6 +3,9 @@ from Config import Config
 from ExperimentResult import ExperimentResult
 from algorithms import ALGORITHMS
 from visualize import plot_convergence
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def experiment_runner(config: Config, n_runs: int = 6, plot_convergence_flag: bool = False
@@ -16,6 +19,7 @@ def experiment_runner(config: Config, n_runs: int = 6, plot_convergence_flag: bo
     results: Dict[str, List[ExperimentResult]] = {}
 
     for name, solve in ALGORITHMS.items():
+        logger.info(f"Running {name} for {n_runs} runs...")
         try:
             runs: List[ExperimentResult] = []
             first_convergence = None
@@ -32,12 +36,14 @@ def experiment_runner(config: Config, n_runs: int = 6, plot_convergence_flag: bo
                     p_residual=sol.p_residual,
                     s_residual=sol.s_residual,
                 ))
+                logger.debug(f"Run {i + 1}/{n_runs} for {name} completed in {sol.runtime:.2f} seconds with objective {sol.obj} and primal residual {sol.p_residual}.")
+
 
             if plot_convergence_flag and first_convergence is not None:
                 plot_convergence(first_convergence, title=f"{name} convergence")
 
             results[name] = runs
         except NotImplementedError:
-            print(f"skipping {name}: not implemented")
+            logger.warning(f"skipping {name}: not implemented")
 
     return results

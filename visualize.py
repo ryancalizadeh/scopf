@@ -1,8 +1,13 @@
 from typing import Dict, List
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from ExperimentResult import AggregatedResult
 from algorithms.base import ConvergenceHistory
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def plot_runtime_scaling(aggregated_by_config: Dict[float, Dict[str, AggregatedResult]],
@@ -50,14 +55,14 @@ def plot_convergence(history: ConvergenceHistory, title: str = "ADMM convergence
 
 def print_dispatch_comparison(aggregated: Dict[str, AggregatedResult], reference: str = "centralized"):
     if reference not in aggregated:
-        print(f"No '{reference}' result available for comparison.")
+        logger.info(f"No '{reference}' result available for comparison.")
         return
 
     ref = aggregated[reference]
-    print(f"Dispatch/objective deviation vs '{reference}':")
+    logger.info(f"Dispatch/objective deviation vs '{reference}':")
     for name, agg in aggregated.items():
         if name == reference:
             continue
         dispatch_diff = float(np.linalg.norm(agg.dispatch_ref - ref.dispatch_ref))
         obj_diff = abs(agg.obj_mean - ref.obj_mean)
-        print(f"  {name}: ||dispatch_diff||={dispatch_diff:.6g}, |obj_diff|={obj_diff:.6g}")
+        logger.info(f"  {name}: ||dispatch_diff||={dispatch_diff:.6g}, |obj_diff|={obj_diff:.6g}")

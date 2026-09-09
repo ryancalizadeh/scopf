@@ -31,7 +31,7 @@ class Config:
     load_fraction: float
 
     def __init__(self, n_buses: int, gen_ratio: float, load_ratio: float, avg_degree: float,
-                 T: float = 2.0, dt: float = 0.1, load_step_factor: float = 1.2,
+                 T: float = 2.0, dt: float = 0.2, load_step_factor: float = 1.2,
                  load_fraction: float = 0.3):
         rng = np.random.default_rng(seed=42)  # For reproducibility
         self.T = T

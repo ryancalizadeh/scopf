@@ -1,10 +1,11 @@
 import os
 import queue
 import threading
+import multiprocessing
 import numpy as np
 import casadi as ca
 import cvxpy as cp
-from scipy.linalg import expm
+from scipy.linalg import expm, qr
 from typing import Any, Dict, cast
 from Config import Config
 
@@ -297,20 +298,11 @@ class EmptyBus(Proxable):
         return ret
 
 
-class F(Proxable):
+class FCvxpy(Proxable):
     """
-    f = c(w) + ind_Bnet(w) + ind_C(w)
-    where w = (V, I, S=P+jQ, delta, omega),
-    c(w) = sum_{j=1}^{n_gens} c_j P_j(0)^2
-    B_net = {V, I, S | I(t) = Y_bus @ V(t) for all t, Im V_0(0) = 0 (slack angle reference)}
-    C = {V, I, S, delta, omega |
-        P_{min, i} <= P_i(0) <= P_{max, i},
-        Q_{min, i} <= Q_i(0) <= Q_{max, i},
-        |I_{kl}(0)| <= I_{kl}^{max} for all lines (k, l),
-        |delta_i(t) - delta_coi(t)| <= 100 deg for all t,
-    }
-    omega (the rotor speed deviation omega_abs - omega_s) is unconstrained by f, so its prox is the
-    identity and it bypasses the solver.
+    Reference implementation of the network prox F (see class F for the
+    definition of f). Kept for verification and as a fallback: it solves the
+    whole prox as one cvxpy cone program over all buses and time steps.
 
     f is convex (quadratic cost, linear network / limit constraints, second-order-cone line
     limits) and its proximal operator is computed with cvxpy. The problem is built once in
@@ -318,7 +310,9 @@ class F(Proxable):
     objective parameter-affine, the prox term is expanded as
         rho/2 ||x - z||^2 = rho/2 ||x||^2 - <rho z, x> + const
     with rho*z passed in as parameters. cvxpy therefore canonicalises the problem once and every
-    prox call is a parameter update plus a solve (CLARABEL by default).
+    prox call is a parameter update plus a solve (CLARABEL by default). The canonicalisation
+    time grows superlinearly with n_buses * N (0.6 s at 15 buses, 19 s at 45 buses for N = 20),
+    which is why F below exploits the separability of f instead.
     """
 
     _KEYS = ("v_re", "v_im", "i_re", "i_im", "p", "q")
@@ -426,6 +420,206 @@ class F(Proxable):
         })
 
 
+class F(Proxable):
+    """
+    f = c(w) + ind_Bnet(w) + ind_C(w)
+    where w = (V, I, S=P+jQ, delta, omega),
+    c(w) = sum_{j=1}^{n_gens} c_j P_j(0)^2
+    B_net = {V, I, S | I(t) = Y_bus @ V(t) for all t, Im V_0(0) = 0 (slack angle reference)}
+    C = {V, I, S, delta, omega |
+        P_{min, i} <= P_i(0) <= P_{max, i},
+        Q_{min, i} <= Q_i(0) <= Q_{max, i},
+        |I_{kl}(0)| <= I_{kl}^{max} for all lines (k, l),
+        |delta_i(t) - delta_coi(t)| <= 100 deg for all t,
+    }
+    omega (the rotor speed deviation omega_abs - omega_s) is unconstrained by f, so its prox is the
+    identity.
+
+    prox_{rho, f}(z) = argmin_w f(w) + rho/2 ||w - z||^2 separates over time steps and, within a
+    time step, over the independent variable groups, so it is evaluated block by block:
+
+      (V_t, I_t), t >= 1 : orthogonal projection onto the subspace {I = Y V} (rho cancels).
+                           With x_t = [V_re; V_im; I_re; I_im] and A_1 = [[G, -B, -I, 0], [B, G, 0, -I]]
+                           the projection is x - Q_1 Q_1^T x, Q_1 an orthonormal basis of range(A_1^T)
+                           (economic QR, computed once). All t >= 1 columns go through one matrix product.
+      (V_0, I_0)         : same with the slack row Im V_0(0) = 0 appended (basis Q_0). If the projected
+                           point satisfies every line limit |I_kl(0)| <= I_max it is also the projection
+                           onto the intersection with the line-flow cones, so the cone program is only
+                           solved (small DPP cvxpy SOCP in 4 n_buses variables, built lazily) when a
+                           line limit is violated.
+      S_0 at generators  : 1-D closed form: P = clip(rho z_P / (2 c_i + rho), P_min, P_max), Q = clip(z_Q,
+                           Q_min, Q_max) (the clipped unconstrained minimiser is exact for a convex
+                           1-D quadratic on an interval); every other S entry is the identity.
+      delta_t            : identity when |delta_i - delta_coi| <= 100 deg already holds, otherwise a
+                           tiny DPP cvxpy QP in n_gens variables (per violating time step).
+      omega              : identity.
+
+    Setup cost is one QR of a (4 n_buses) x (2 n_buses + 1) matrix; the per-call cost is a few dense
+    matrix products, independent of rho except for the closed-form P update.
+    """
+
+    def __init__(self, config: Config, solver: str = "CLARABEL"):
+        self.config = config
+        self.solver = solver
+        nb, ng, N = config.n_buses, config.n_gens, config.N
+        self.n_buses, self.n_gens, self.N = nb, ng, N
+
+        G = np.asarray(config.G, dtype=float)
+        B = np.asarray(config.B, dtype=float)
+        self.G, self.B = G, B
+        I_nb = np.eye(nb)
+        Z_nb = np.zeros((nb, nb))
+        # Rows of the network equations in x = [V_re; V_im; I_re; I_im]
+        A1 = np.block([[G, -B, -I_nb, Z_nb], [B, G, Z_nb, -I_nb]])
+        slack_row = np.zeros((1, 4 * nb))
+        slack_row[0, nb] = 1.0  # V_im[0]
+        A0 = np.vstack([A1, slack_row])
+        self.Q1 = self._range_basis(A1)
+        self.Q0 = self._range_basis(A0)
+
+        lines = [(k, l, G[k, l], B[k, l]) for k in range(nb) for l in range(k + 1, nb)
+                 if G[k, l] != 0 or B[k, l] != 0]
+        self.line_k = np.array([k for k, _, _, _ in lines], dtype=int)
+        self.line_l = np.array([l for _, l, _, _ in lines], dtype=int)
+        self.line_G = np.array([g for _, _, g, _ in lines], dtype=float)
+        self.line_B = np.array([b for _, _, _, b in lines], dtype=float)
+        self.line_limit = float(config.line_flow_limits)
+
+        self.costs = np.asarray(config.costs, dtype=float)
+        self.P_min = np.asarray(config.P_min, dtype=float)
+        self.P_max = np.asarray(config.P_max, dtype=float)
+        self.Q_min = np.asarray(config.Q_min, dtype=float)
+        self.Q_max = np.asarray(config.Q_max, dtype=float)
+
+        M = np.asarray(config.M, dtype=float)
+        self.coi_w = M / M.sum()
+        self._coi_qp = self._build_coi_qp() if ng > 1 else None
+        self._t0_socp = None  # built on first line-limit violation
+
+        self.n_socp_fallbacks = 0
+        self.n_coi_projections = 0
+
+    @staticmethod
+    def _range_basis(A: np.ndarray) -> np.ndarray:
+        """Orthonormal basis of range(A^T) (A has full row rank here)."""
+        Q, _ = qr(A.T, mode="economic") # type: ignore
+        return np.asarray(Q)
+
+    @staticmethod
+    def _project_network(X: np.ndarray, Q: np.ndarray) -> np.ndarray:
+        """Projects the columns of X onto the null space of A, given Q = basis of range(A^T)."""
+        return X - Q @ (Q.T @ X)
+
+    def _line_currents(self, x0: np.ndarray) -> np.ndarray:
+        nb = self.n_buses
+        V_re, V_im = x0[:nb], x0[nb:2 * nb]
+        dV_re = V_re[self.line_k] - V_re[self.line_l]
+        dV_im = V_im[self.line_k] - V_im[self.line_l]
+        I_re = -dV_re * self.line_G + dV_im * self.line_B
+        I_im = -dV_re * self.line_B - dV_im * self.line_G
+        return np.hypot(I_re, I_im)
+
+    def _build_t0_socp(self):
+        nb = self.n_buses
+        G, B = self.G, self.B
+        x = cp.Variable(4 * nb)
+        z = cp.Parameter(4 * nb)
+        V_re, V_im, I_re, I_im = x[:nb], x[nb:2 * nb], x[2 * nb:3 * nb], x[3 * nb:]
+        constraints = [
+            I_re == G @ V_re - B @ V_im,
+            I_im == B @ V_re + G @ V_im,
+            V_im[0] == 0,
+        ]
+        for k, l, g, b in zip(self.line_k, self.line_l, self.line_G, self.line_B):
+            I_re_kl = -(V_re[k] - V_re[l]) * g + (V_im[k] - V_im[l]) * b
+            I_im_kl = -(V_re[k] - V_re[l]) * b - (V_im[k] - V_im[l]) * g
+            constraints.append(cp.norm(cp.hstack([I_re_kl, I_im_kl])) <= self.line_limit)
+        # ||x - z||^2 up to a constant, parameter-affine for DPP
+        problem = cp.Problem(cp.Minimize(cp.sum_squares(x) - 2 * (z @ x)), constraints)
+        return problem, x, z
+
+    def _build_coi_qp(self):
+        ng = self.n_gens
+        d = cp.Variable(ng)
+        z = cp.Parameter(ng)
+        dev = d - self.coi_w @ d
+        constraints = [dev <= DELTA_COI_MAX, dev >= -DELTA_COI_MAX]
+        problem = cp.Problem(cp.Minimize(cp.sum_squares(d) - 2 * (z @ d)), constraints)
+        return problem, d, z
+
+    # The fallback problems are tiny, so solve them tightly (1e-12 is not
+    # reliably reachable and makes Clarabel return "optimal_inaccurate");
+    # these are Clarabel option names, other solvers get their defaults.
+    _TIGHT = {"tol_gap_abs": 1e-10, "tol_gap_rel": 1e-10, "tol_feas": 1e-10, "max_iter": 500}
+
+    def _solve_small(self, problem, what: str) -> None:
+        opts = self._TIGHT if self.solver == "CLARABEL" else {}
+        problem.solve(solver=self.solver, **opts)
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            raise ValueError(f"F.prox {what} did not converge: {problem.status}")
+
+    def _project_t0(self, x0_raw: np.ndarray) -> np.ndarray:
+        x0 = self._project_network(x0_raw[:, None], self.Q0)[:, 0]
+        if self.line_k.size and np.any(self._line_currents(x0) > self.line_limit * (1 + 1e-9) + 1e-12):
+            if self._t0_socp is None:
+                self._t0_socp = self._build_t0_socp()
+            problem, x, z = self._t0_socp
+            z.value = x0_raw
+            self._solve_small(problem, "t=0 line-flow SOCP")
+            x0 = np.asarray(x.value, dtype=float)
+            self.n_socp_fallbacks += 1
+        return x0
+
+    def _project_coi(self, delta: np.ndarray) -> np.ndarray:
+        """delta: (n_gens, N). Projects each violating column onto the COI polytope."""
+        dev = delta - self.coi_w @ delta
+        violating = np.where(np.abs(dev).max(axis=0) > DELTA_COI_MAX + 1e-12)[0]
+        if violating.size == 0:
+            return delta
+        out = delta.copy()
+        problem, d, z = cast(tuple, self._coi_qp)
+        for t in violating:
+            z.value = delta[:, t]
+            self._solve_small(problem, "COI projection")
+            out[:, t] = np.asarray(d.value, dtype=float)
+            self.n_coi_projections += 1
+        return out
+
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        nb, ng, N = self.n_buses, self.n_gens, self.N
+        # Trajectory arrays are (N, width); work width-major here.
+        V0 = z["v"].T
+        I0 = z["i"].T
+        X = np.vstack([np.real(V0), np.imag(V0), np.real(I0), np.imag(I0)])  # (4 nb, N)
+
+        Xp = np.empty_like(X)
+        if N > 1:
+            Xp[:, 1:] = self._project_network(X[:, 1:], self.Q1)
+        Xp[:, 0] = self._project_t0(X[:, 0])
+
+        V = Xp[:nb] + 1j * Xp[nb:2 * nb]
+        I = Xp[2 * nb:3 * nb] + 1j * Xp[3 * nb:]
+
+        S = np.array(z["s"].T, dtype=complex)
+        zP = np.real(S[:ng, 0])
+        zQ = np.imag(S[:ng, 0])
+        P = np.clip(rho * zP / (2.0 * self.costs + rho), self.P_min, self.P_max)
+        Q = np.clip(zQ, self.Q_min, self.Q_max)
+        S[:ng, 0] = P + 1j * Q
+
+        delta = np.array(z["delta"].T, dtype=float)
+        if ng > 1:
+            delta = self._project_coi(delta)
+
+        return Trajectory({
+            "v": V.T,
+            "i": I.T,
+            "s": S.T,
+            "delta": delta.T,
+            "omega": z["omega"].copy(),
+        })
+
+
 class BusBehaviours(Proxable):
     """
     A class implementing projections onto the behaviours of a set of buses, each with its own behaviour (e.g., constant power load, generator, etc.)
@@ -523,6 +717,124 @@ class BusBehavioursParallel(Proxable):
             pass
 
 
+def _process_worker_main(conn, config: Config, indices: list[int]) -> None:
+    """
+    Entry point of a bus-projection worker process. Builds the behaviours for
+    its own buses (casadi objects never cross the process boundary), then
+    serves ("prox", [single-bus Trajectory, ...], rho) and ("stats",) requests
+    until it receives None.
+    """
+    behaviours = {i: make_bus_behaviour(config, i) for i in indices}
+    while True:
+        msg = conn.recv()
+        if msg is None:
+            break
+        try:
+            if msg[0] == "prox":
+                _, slices, rho = msg
+                conn.send(("ok", [behaviours[i].prox(zb, rho) for i, zb in zip(indices, slices)]))
+            elif msg[0] == "stats":
+                conn.send(("ok", {
+                    i: {"n_failures": getattr(b, "n_failures", 0), "E": getattr(b, "E", None)}
+                    for i, b in behaviours.items()
+                }))
+            else:
+                conn.send(("error", RuntimeError(f"unknown request {msg[0]!r}")))
+        except BaseException as exc:  # ship the failure to the parent instead of dying silently
+            conn.send(("error", RuntimeError(f"{type(exc).__name__}: {exc}")))
+    conn.close()
+
+
+class _ProcessWorker:
+    """
+    One persistent worker process owning a fixed subset of buses, driven over
+    a Pipe. Started with the "spawn" context (the only one on Windows), so the
+    module must be importable in the child and scripts need the
+    `if __name__ == "__main__"` guard.
+    """
+
+    def __init__(self, config: Config, indices: list[int]):
+        ctx = multiprocessing.get_context("spawn")
+        self.indices = indices
+        # The per-bus problems are tiny; one BLAS/OpenMP thread per worker
+        # process avoids oversubscribing the cores (inherited by the child).
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(var, "1")
+        self._conn, child_conn = ctx.Pipe()
+        self._proc = ctx.Process(target=_process_worker_main, args=(child_conn, config, indices), daemon=True)
+        self._proc.start()
+        child_conn.close()
+
+    def submit(self, z: Trajectory, rho: float) -> None:
+        self._conn.send(("prox", [z.at_bus[i] for i in self.indices], rho))
+
+    def _receive(self):
+        status, payload = self._conn.recv()
+        if status == "error":
+            raise payload
+        return payload
+
+    def collect(self) -> list[tuple[int, Trajectory]]:
+        return list(zip(self.indices, self._receive()))
+
+    def stats(self) -> dict:
+        self._conn.send(("stats",))
+        return self._receive()
+
+    def stop(self) -> None:
+        try:
+            self._conn.send(None)
+            self._conn.close()
+        except (OSError, ValueError, BrokenPipeError):
+            pass
+        self._proc.join(timeout=5)
+
+
+class BusBehavioursProcesses(Proxable):
+    """
+    Same as BusBehaviours, but every bus's projection runs in one of a pool of
+    persistent worker processes (static round-robin assignment, so generator
+    buses are spread evenly and each behaviour's warm start stays with the bus).
+    Unlike threads this is not limited by the interpreter lock, and the casadi
+    thread-affinity problem cannot arise because each process has one thread.
+    Per iteration one message per worker goes out (the single-bus slices of z)
+    and one comes back.
+    """
+
+    def __init__(self, config: Config, n_workers: int | None = None):
+        self.config = config
+        n_buses = config.n_buses
+        n_workers = max(1, min(n_buses, n_workers or (os.cpu_count() or 1)))
+        self.n_workers = n_workers
+        self.assignments = [list(range(w, n_buses, n_workers)) for w in range(n_workers)]
+        self._workers = [_ProcessWorker(config, indices) for indices in self.assignments]
+
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        ret = z.copy()
+        for worker in self._workers:
+            worker.submit(z, rho)
+        for worker in self._workers:
+            for i, ret_i in worker.collect():
+                ret.at_bus[i] = ret_i
+        return ret
+
+    def stats(self) -> dict:
+        merged: dict = {}
+        for worker in self._workers:
+            merged.update(worker.stats())
+        return dict(sorted(merged.items()))
+
+    def close(self) -> None:
+        for worker in self._workers:
+            worker.stop()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
     """
     Residual-balancing heuristic. Known not to work for this nonconvex
@@ -540,7 +852,7 @@ def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
         return rho_prev
 
 
-def rho_geometric(rho_0: float = 2.0, growth: float = 1.003, rho_max: float = 100.0):
+def rho_geometric(rho_0: float = 2.0, growth: float = 1.007, rho_max: float = 200.0):
     """
     Returns a rho schedule for admm.admm: rho_k = min(rho_0 * growth**k, rho_max),
     i.e. a geometric ramp from rho_0 up to rho_max, independent of the residuals.
@@ -550,18 +862,38 @@ def rho_geometric(rho_0: float = 2.0, growth: float = 1.003, rho_max: float = 10
     return schedule
 
 
-def make_bus_behaviours(config: Config, parallel: bool = False) -> Proxable:
-    n_buses = config["n_buses"]
+def make_bus_behaviour(config: Config, bus_index: int) -> Proxable:
+    """
+    Behaviour of a single bus: generators occupy the first n_gens indices,
+    loads the next n_loads, the remaining buses are empty.
+    """
     n_gens = config["n_gens"]
     n_loads = config["n_loads"]
-    behaviours = [
-        *(Generator(config, bus_index=i, gen_index=i) for i in range(n_gens)),
-        *(ConstPowerLoad(config, bus_index=i, load_index=i - n_gens) for i in range(n_gens, n_gens + n_loads)),
-        *(EmptyBus(config, bus_index=i) for i in range(n_gens + n_loads, n_buses))
-    ]
-    if parallel:
-        return BusBehavioursParallel(behaviours)
-    return BusBehaviours(behaviours)
+    if bus_index < n_gens:
+        return Generator(config, bus_index=bus_index, gen_index=bus_index)
+    if bus_index < n_gens + n_loads:
+        return ConstPowerLoad(config, bus_index=bus_index, load_index=bus_index - n_gens)
+    return EmptyBus(config, bus_index=bus_index)
+
+
+def make_bus_behaviours(config: Config, parallel: "bool | str" = False, n_workers: int | None = None) -> Proxable:
+    """
+    parallel: False / "sequential" -> BusBehaviours (one after another),
+              True / "threads"     -> BusBehavioursParallel (pinned worker threads),
+              "processes"          -> BusBehavioursProcesses (worker processes).
+    """
+    if isinstance(parallel, bool):
+        mode = "threads" if parallel else "sequential"
+    else:
+        mode = parallel
+    if mode == "processes":
+        return BusBehavioursProcesses(config, n_workers)
+    behaviours = [make_bus_behaviour(config, i) for i in range(config["n_buses"])]
+    if mode == "threads":
+        return BusBehavioursParallel(behaviours, n_workers)
+    if mode == "sequential":
+        return BusBehaviours(behaviours)
+    raise ValueError(f"unknown parallel mode {parallel!r}; use False, True, 'sequential', 'threads' or 'processes'")
 
 
 def check_solution(z: Trajectory, config: Config) -> Dict[str, float]:
