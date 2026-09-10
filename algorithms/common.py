@@ -838,9 +838,12 @@ class BusBehavioursProcesses(Proxable):
 def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
     """
     Residual-balancing heuristic. Known not to work for this nonconvex
-    splitting (it shrinks rho once the dual residual dominates and the
-    iteration falls into a limit cycle); kept for reference only. Prefer
-    rho_geometric or a fixed rho.
+    splitting; kept for reference only. Every prox in the splitting is a
+    projection except the small P(0) cost term, so the ADMM iterates are
+    essentially independent of the value of rho (measured 2026-09-09: fixed
+    rho in {5 .. 1000} gives the same residual plateau / limit cycle). What
+    converges is the dual rescaling that admm.admm applies whenever rho
+    changes, i.e. a ramp that never stops: see rho_geometric / rho_for_size.
     """
     if rho_prev == 0:
         return 2.0
@@ -852,14 +855,50 @@ def rho_heuristic(iteration, rho_prev, r, s, tau=2, mu=10):
         return rho_prev
 
 
-def rho_geometric(rho_0: float = 2.0, growth: float = 1.007, rho_max: float = 200.0):
+def rho_geometric(rho_0: float = 2.0, growth: float = 1.007, rho_max: float = float("inf")):
     """
     Returns a rho schedule for admm.admm: rho_k = min(rho_0 * growth**k, rho_max),
-    i.e. a geometric ramp from rho_0 up to rho_max, independent of the residuals.
+    i.e. a geometric ramp from rho_0, independent of the residuals.
+
+    The ramp is not about the size of rho: admm.admm rescales the dual variable
+    by rho_{k-1}/rho_k whenever rho changes, and that damping of the dual
+    memory is what breaks the limit cycles of the otherwise rho-invariant
+    iteration. A cap that binds before the stop criterion is met switches the
+    damping off and the residual drifts back into the cycle (measured: cap 200
+    reached at iteration ~660 makes the 15-bus case stall at r ~ 2e-3, and
+    holding rho once r < 1e-4 stalls too). Leave rho_max at infinity and let
+    the stop rule (r and |dz| below the threshold) end the run.
+
+    The growth rate trades speed for bias: the faster the dual is damped, the
+    further the fixed point drifts from the true optimum. Use rho_for_size to
+    pick it from the network size.
     """
     def schedule(iteration, rho_prev, r, s):
         return float(min(rho_0 * growth ** iteration, rho_max))
     return schedule
+
+
+def rho_for_size(n_buses: int, rho_0: float = 2.0, max_growth: float = 0.007, growth_scale: float = 0.18):
+    """
+    Size-dependent geometric ramp: growth = 1 + min(max_growth, growth_scale / n_buses),
+    uncapped. Empirical calibration (N = 10, flat start, dispatch error vs
+    centralized once r < ~1e-5):
+
+        buses   growth   iterations to r < 1e-4   dispatch error
+          8     1.007            650                 0.003 %
+         15     1.007           1660                 0.3 %
+         15     1.02             590                 1.7 %
+         15     1.05             560                12 %
+         25     1.007           1310                 0.2 %
+         45     1.007           1480                 2.1 %
+         45     1.004           2560                 0.11 %
+
+    Larger networks need slower damping to stay unbiased, hence the 1/n_buses
+    rule (1.007 up to 25 buses, ~1.004 at 45, ~1.0013 at 135, ~1.0004 at 405);
+    the 135+ values are extrapolated, not calibrated.
+    """
+    growth = 1.0 + min(max_growth, growth_scale / max(int(n_buses), 1))
+    return rho_geometric(rho_0=rho_0, growth=growth, rho_max=float("inf"))
 
 
 def make_bus_behaviour(config: Config, bus_index: int) -> Proxable:
