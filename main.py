@@ -27,7 +27,7 @@ def _run_sweep(configs: dict, results_dir: str, run_timestamp: str, sweep_name: 
 
     for key, config in configs.items():
         logger.info(f"Running experiment for {key}")
-        results = experiment_runner(config, n_runs=3, plot_convergence_flag=True)
+        results = experiment_runner(config, n_runs=1, plot_convergence_flag=True)
         raw_results[key] = results
         aggregated_results[key] = {name: aggregate(runs) for name, runs in results.items()}
 

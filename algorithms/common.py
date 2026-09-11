@@ -59,15 +59,31 @@ def _solve_or_last_iterate(opti: ca.Opti):
 
 class ConstPowerLoad(Proxable):
     """
-    A class implementing the prox operator on the indicator function of the behaviour set of a constant power load (i.e. projection onto the behaviour set)
-    Specifically, the load is modelled as a constant complex power taken from config.load_P and config.load_Q, scaled by config.load_step_factor for t >= 1 (the load-step disturbance used by algorithms.centralized).
-    The behaviour of the load is defined as:
-    B = {V(t), I(t), S(t) | S(t) = V(t) * conj(I(t)), S(t) = -scale(t) * S_load for all t}
+    A class implementing the prox operator on the indicator function of the behaviour set of a
+    constant power load (i.e. projection onto the behaviour set).
+
+    The load is constant-power only at t = 0 (the pre-disturbance steady state), where it draws
+    the complex power in config.load_P / load_Q. For t >= 1 it is modelled as a constant
+    impedance that Config folds into the transient admittance matrices (Y_fault / Y_post), so
+    that the network stays solvable at the depressed voltages of a fault; a constant-power load
+    cannot be served at |V| ~ 0.01.
+
+    IMPORTANT: this does NOT mean the load stops drawing current for t >= 1. The term y_L * V
+    inside Y @ V carries exactly the current the load device drew before, so the bus current is
+    unchanged. What is zero for t >= 1 is only the *residual device injection*
+    I(t) - Y(t) @ V(t) at that bus, which is what the device's own variables represent here.
+    Consequently this prox reports I(t) = 0 and S(t) = 0 for t >= 1: those zeros mean "no
+    injection on top of the network", not "no load". The true transient consumption of the bus
+    is |V(t)|^2 * conj(y_L) with y_L from config.load_admittance().
+
+    The behaviour set is therefore
+    B = {V(t), I(t), S(t) | S(0) = V(0) conj(I(0)) = -S_load, I(t) = S(t) = 0 for t >= 1}
     and V_bb = {V(t) | V_min^2 <= |V(0)|^2 <= V_max^2}
-    and f = ind_B + ind_V_bb, so prox_{rho, f} = proj_(B cap V_bb)
-    The projection is computed using casadi and IPOPT, and is set up once. Previous solutions are used to warmstart the solver for the next iteration.
-    Since this prox reduces to a pure projection, rho is ignored.
-    S(t) is fixed, so the projection only has to find (V(t), I(t)) closest to (V0(t), I0(t)) on the hyperbola V(t) conj(I(t)) = S(t); it is separable over t and solved as one block-diagonal NLP.
+    and f = ind_B + ind_V_bb, so prox_{rho, f} = proj_(B cap V_bb).
+
+    Only the t = 0 block needs a solver (a projection onto the hyperbola V conj(I) = -S_load
+    intersected with the voltage annulus); it is set up once with casadi/IPOPT and warm-started
+    from the previous solution. Since this prox reduces to a pure projection, rho is ignored.
     """
 
     def __init__(self, config: Config, bus_index: int, load_index: int, max_iter=100, tol=1e-8):
@@ -81,33 +97,34 @@ class ConstPowerLoad(Proxable):
         V_max = float(config.V_max[bus_index])
 
         # A load draws power from the network, i.e. it injects the negative of
-        # its consumption.
-        scale = _load_scale(config)
-        self.P_load = -scale * float(config.load_P[load_index])
-        self.Q_load = -scale * float(config.load_Q[load_index])
+        # its consumption. Only the pre-disturbance step is constant power.
+        self.P_load = -float(config.load_P[load_index])
+        self.Q_load = -float(config.load_Q[load_index])
         self.S_load = self.P_load + 1j * self.Q_load
+        # Constant-impedance representation used for t >= 1 (folded into Y by
+        # Config); kept here so the true transient consumption is recoverable.
+        self.y_load = float(config.load_P[load_index]) - 1j * float(config.load_Q[load_index])
 
         opti = ca.Opti()
-        self.V_re = opti.variable(N)
-        self.V_im = opti.variable(N)
-        self.I_re = opti.variable(N)
-        self.I_im = opti.variable(N)
+        self.V_re = opti.variable()
+        self.V_im = opti.variable()
+        self.I_re = opti.variable()
+        self.I_im = opti.variable()
 
-        self.v0r = opti.parameter(N)
-        self.v0i = opti.parameter(N)
-        self.i0r = opti.parameter(N)
-        self.i0i = opti.parameter(N)
+        self.v0r = opti.parameter()
+        self.v0i = opti.parameter()
+        self.i0r = opti.parameter()
+        self.i0i = opti.parameter()
 
         opti.minimize(
-            ca.sumsqr(self.V_re - self.v0r) + ca.sumsqr(self.V_im - self.v0i)
-            + ca.sumsqr(self.I_re - self.i0r) + ca.sumsqr(self.I_im - self.i0i)
+            (self.V_re - self.v0r)**2 + (self.V_im - self.v0i)**2
+            + (self.I_re - self.i0r)**2 + (self.I_im - self.i0i)**2
         )
 
-        for n in range(N):
-            opti.subject_to(self.V_re[n] * self.I_re[n] + self.V_im[n] * self.I_im[n] == self.P_load[n])
-            opti.subject_to(self.V_im[n] * self.I_re[n] - self.V_re[n] * self.I_im[n] == self.Q_load[n])
+        opti.subject_to(self.V_re * self.I_re + self.V_im * self.I_im == self.P_load)
+        opti.subject_to(self.V_im * self.I_re - self.V_re * self.I_im == self.Q_load)
 
-        V_sq0 = self.V_re[0]**2 + self.V_im[0]**2
+        V_sq0 = self.V_re**2 + self.V_im**2
         opti.subject_to(V_sq0 >= V_min**2)
         opti.subject_to(V_sq0 <= V_max**2)
 
@@ -116,16 +133,24 @@ class ConstPowerLoad(Proxable):
         self._warm = None
         self.n_failures = 0
 
+    def transient_power(self, V: np.ndarray) -> np.ndarray:
+        """
+        True power consumed by this load during the transient, |V|^2 conj(y_L),
+        for the voltages V (one per time step). Needed because the trajectory's
+        S is zero at load buses for t >= 1 (see the class docstring).
+        """
+        return np.abs(np.asarray(V)) ** 2 * np.conj(self.y_load)
+
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        V0 = z["v"][:, 0]
-        I0 = z["i"][:, 0]
+        V0 = complex(z["v"][0, 0])
+        I0 = complex(z["i"][0, 0])
 
-        self.opti.set_value(self.v0r, np.real(V0))
-        self.opti.set_value(self.v0i, np.imag(V0))
-        self.opti.set_value(self.i0r, np.real(I0))
-        self.opti.set_value(self.i0i, np.imag(I0))
+        self.opti.set_value(self.v0r, V0.real)
+        self.opti.set_value(self.v0i, V0.imag)
+        self.opti.set_value(self.i0r, I0.real)
+        self.opti.set_value(self.i0i, I0.imag)
 
-        warm = self._warm if self._warm is not None else (np.real(V0), np.imag(V0), np.real(I0), np.imag(I0))
+        warm = self._warm if self._warm is not None else (V0.real, V0.imag, I0.real, I0.imag)
         for var, val in zip((self.V_re, self.V_im, self.I_re, self.I_im), warm):
             self.opti.set_initial(var, val)
 
@@ -133,13 +158,17 @@ class ConstPowerLoad(Proxable):
         if not converged:
             self.n_failures += 1
 
-        V_re, V_im, I_re, I_im = (np.reshape(value(var), self.N) for var in (self.V_re, self.V_im, self.I_re, self.I_im))
+        V_re, V_im, I_re, I_im = (float(value(var)) for var in (self.V_re, self.V_im, self.I_re, self.I_im))
         self._warm = (V_re, V_im, I_re, I_im)
 
         ret = z.copy()
-        ret["v"][:, 0] = V_re + 1j * V_im
-        ret["i"][:, 0] = I_re + 1j * I_im
-        ret["s"][:, 0] = self.S_load
+        ret["v"][0, 0] = V_re + 1j * V_im
+        ret["i"][0, 0] = I_re + 1j * I_im
+        ret["s"][0, 0] = self.S_load
+        # t >= 1: the load lives in the admittance matrix, so the device adds
+        # no injection of its own. V is unconstrained here and passes through.
+        ret["i"][1:, 0] = 0
+        ret["s"][1:, 0] = 0
         return ret
 
 
@@ -154,9 +183,11 @@ class Generator(Proxable):
         E e^{j delta(t)} = V(t) + j Xd I(t),
         omega(0) = 0,
         }
-    The DAE model is discretized using exact zero-order hold (ZOH) discretization (gen_discrete_step),
-    the mechanical power is the pre-disturbance dispatch P(0), and E >= 0 is a constant internal to the
-    projection (it is not part of the consensus trajectory; the last value is kept in self.E).
+    The DAE model is discretized with the exact first-order hold (gen_discrete_step_foh): the
+    electrical power is interpolated linearly across each step, which a fault transient requires
+    at dt = 0.05 s. The mechanical power is the pre-disturbance dispatch P(0), and E >= 0 is a
+    constant internal to the projection (it is not part of the consensus trajectory; the last
+    value is kept in self.E).
     V_bb = {V(t) | V_min^2 <= |V(0)|^2 <= V_max^2} (config.V_min / V_max are magnitudes)
     and f = ind_B + ind_V_bb, so prox_{rho, f} = proj_(B cap V_bb)
     The projection operator is computed using casadi and IPOPT, and is set up once. Previous solutions are used to warmstart the solver for the next iteration.
@@ -213,9 +244,11 @@ class Generator(Proxable):
             opti.subject_to(r["r_re"] == 0)
             opti.subject_to(r["r_im"] == 0)
 
-        # Exact ZOH discretization of the swing equation, mechanical power = P(0)
+        # Exact FOH discretization of the swing equation, mechanical power = P(0)
         for n in range(N - 1):
-            step = gen_discrete_step(config, gen_index, self.delta[n], self.omega[n], self.P[n], self.P[0])
+            step = gen_discrete_step_foh(
+                config, gen_index, self.delta[n], self.omega[n], self.P[n], self.P[n + 1], self.P[0]
+            )
             opti.subject_to(self.delta[n + 1] == step["delta_next"])
             opti.subject_to(self.omega[n + 1] == step["omega_next"])
 
@@ -357,9 +390,6 @@ class FCvxpy(Proxable):
         prox_term -= cp.sum(cp.multiply(self.rz_delta, delta))
 
         constraints = [
-            # Network equations for all t
-            I_re == G @ V_re - B @ V_im,
-            I_im == B @ V_re + G @ V_im,
             # Slack angle reference for the pre-disturbance steady state
             V_im[0, 0] == 0,
             # Generation limits at t = 0
@@ -368,6 +398,13 @@ class FCvxpy(Proxable):
             Q[:n_gens, 0] >= config.Q_min,
             Q[:n_gens, 0] <= config.Q_max,
         ]
+
+        # Network equations, with the admittance following the fault schedule
+        for n in range(self.N):
+            Y_n = np.asarray(config.Y_at(n))
+            G_n, B_n = np.real(Y_n), np.imag(Y_n)
+            constraints.append(I_re[:, n] == G_n @ V_re[:, n] - B_n @ V_im[:, n])
+            constraints.append(I_im[:, n] == B_n @ V_re[:, n] + G_n @ V_im[:, n])
 
         # Line flow limits at t = 0 (second-order cones)
         for k in range(n_buses):
@@ -425,7 +462,10 @@ class F(Proxable):
     f = c(w) + ind_Bnet(w) + ind_C(w)
     where w = (V, I, S=P+jQ, delta, omega),
     c(w) = sum_{j=1}^{n_gens} c_j P_j(0)^2
-    B_net = {V, I, S | I(t) = Y_bus @ V(t) for all t, Im V_0(0) = 0 (slack angle reference)}
+    B_net = {V, I, S | I(t) = Y(t) @ V(t) for all t, Im V_0(0) = 0 (slack angle reference)}
+    where Y(t) follows the fault schedule of Config.Y_at(t): the pre-disturbance matrix at t = 0,
+    the faulted matrix while the fault is on, and the post-fault matrix (faulted line tripped)
+    after clearing. For t >= 1 the loads are inside Y as constant impedances.
     C = {V, I, S, delta, omega |
         P_{min, i} <= P_i(0) <= P_{max, i},
         Q_{min, i} <= Q_i(0) <= Q_{max, i},
@@ -438,10 +478,11 @@ class F(Proxable):
     prox_{rho, f}(z) = argmin_w f(w) + rho/2 ||w - z||^2 separates over time steps and, within a
     time step, over the independent variable groups, so it is evaluated block by block:
 
-      (V_t, I_t), t >= 1 : orthogonal projection onto the subspace {I = Y V} (rho cancels).
-                           With x_t = [V_re; V_im; I_re; I_im] and A_1 = [[G, -B, -I, 0], [B, G, 0, -I]]
-                           the projection is x - Q_1 Q_1^T x, Q_1 an orthonormal basis of range(A_1^T)
-                           (economic QR, computed once). All t >= 1 columns go through one matrix product.
+      (V_t, I_t), t >= 1 : orthogonal projection onto the subspace {I = Y(t) V} (rho cancels).
+                           With x_t = [V_re; V_im; I_re; I_im] and A = [[G, -B, -I, 0], [B, G, 0, -I]]
+                           the projection is x - Q Q^T x, Q an orthonormal basis of range(A^T)
+                           (economic QR). One basis per fault phase is computed at setup and the
+                           steps of each phase go through a single matrix product.
       (V_0, I_0)         : same with the slack row Im V_0(0) = 0 appended (basis Q_0). If the projected
                            point satisfies every line limit |I_kl(0)| <= I_max it is also the projection
                            onto the intersection with the line-flow cones, so the cone program is only
@@ -467,15 +508,21 @@ class F(Proxable):
         G = np.asarray(config.G, dtype=float)
         B = np.asarray(config.B, dtype=float)
         self.G, self.B = G, B
-        I_nb = np.eye(nb)
-        Z_nb = np.zeros((nb, nb))
-        # Rows of the network equations in x = [V_re; V_im; I_re; I_im]
-        A1 = np.block([[G, -B, -I_nb, Z_nb], [B, G, Z_nb, -I_nb]])
+
+        # One network-subspace basis per fault phase. Steps sharing an
+        # admittance matrix share a basis, so the projection of each phase is a
+        # single matrix product. Phases: t = 0 (pre-fault, with the slack row),
+        # 1 <= t <= n_clear (faulted), t > n_clear (post-fault).
         slack_row = np.zeros((1, 4 * nb))
         slack_row[0, nb] = 1.0  # V_im[0]
-        A0 = np.vstack([A1, slack_row])
-        self.Q1 = self._range_basis(A1)
-        self.Q0 = self._range_basis(A0)
+        self.Q0 = self._range_basis(np.vstack([self._network_rows(config.Y_at(0)), slack_row]))
+        self._phase_bases = {}
+        self._phase_of_step = np.zeros(N, dtype=int)
+        for n in range(1, N):
+            phase = 1 if n <= config.n_clear else 2
+            self._phase_of_step[n] = phase
+            if phase not in self._phase_bases:
+                self._phase_bases[phase] = self._range_basis(self._network_rows(config.Y_at(n)))
 
         lines = [(k, l, G[k, l], B[k, l]) for k in range(nb) for l in range(k + 1, nb)
                  if G[k, l] != 0 or B[k, l] != 0]
@@ -498,6 +545,19 @@ class F(Proxable):
 
         self.n_socp_fallbacks = 0
         self.n_coi_projections = 0
+
+    def _network_rows(self, Y: np.ndarray) -> np.ndarray:
+        """
+        Rows of I = Y V in the real coordinates x = [V_re; V_im; I_re; I_im]:
+            [[G, -B, -I, 0], [B, G, 0, -I]]
+        """
+        nb = self.n_buses
+        Y = np.asarray(Y)
+        G = np.real(Y).astype(float)
+        B = np.imag(Y).astype(float)
+        I_nb = np.eye(nb)
+        Z_nb = np.zeros((nb, nb))
+        return np.block([[G, -B, -I_nb, Z_nb], [B, G, Z_nb, -I_nb]])
 
     @staticmethod
     def _range_basis(A: np.ndarray) -> np.ndarray:
@@ -593,8 +653,11 @@ class F(Proxable):
         X = np.vstack([np.real(V0), np.imag(V0), np.real(I0), np.imag(I0)])  # (4 nb, N)
 
         Xp = np.empty_like(X)
-        if N > 1:
-            Xp[:, 1:] = self._project_network(X[:, 1:], self.Q1)
+        # One projection per fault phase (the steps of a phase share Y).
+        for phase, Q in self._phase_bases.items():
+            cols = np.flatnonzero(self._phase_of_step == phase)
+            if cols.size:
+                Xp[:, cols] = self._project_network(X[:, cols], Q)
         Xp[:, 0] = self._project_t0(X[:, 0])
 
         V = Xp[:nb] + 1j * Xp[nb:2 * nb]
@@ -1035,6 +1098,10 @@ def gen_discrete_dynamics(config: Config, gen_idx: int, dt: float | None = None)
     with A_d = expm(A dt), Phi = int_0^dt expm(A s) ds, B_d = Phi B_u, c_d = Phi c
     (c_d = 0 for the speed-deviation state). A_d and Phi are read off a single
     matrix exponential of the augmented matrix [[A dt, I dt], [0, 0]].
+
+    Note: with realistic inertia the zero-order hold needs dt ~ 0.01 s to track
+    a fault transient; gen_discrete_dynamics_foh below is accurate at dt = 0.05
+    and is what the solvers use. This function is kept for reference and tests.
     """
     if dt is None:
         dt = config.dt
@@ -1046,6 +1113,37 @@ def gen_discrete_dynamics(config: Config, gen_idx: int, dt: float | None = None)
     A_d = aug_d[:2, :2]
     Phi = aug_d[:2, 2:]
     return A_d, Phi @ B_u, Phi @ c
+
+
+def gen_discrete_dynamics_foh(config: Config, gen_idx: int, dt: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Exact first-order-hold (ramp-invariant) discretization of
+    gen_continuous_matrices with step dt (defaults to config.dt):
+        x_{n+1} = A_d x_n + B_0 u_n + B_1 u_{n+1}
+    i.e. the input is interpolated linearly across the step instead of being
+    held constant. The matrices come from one exponential of the augmented
+    block matrix [[A dt, B dt, 0], [0, 0, I], [0, 0, 0]]:
+    with expm(...) = [[A_d, G_1, G_2], ...], B_0 = G_1 - G_2 and B_1 = G_2.
+
+    The electrical power P_e varies quickly during a fault transient, so the
+    linear interpolation is far more accurate than a hold: at dt = 0.05 s the
+    FOH matches an adaptive ODE solver within 1 degree of rotor angle where the
+    ZOH is off by tens of degrees. The step stays affine in (x_n, u_n, u_{n+1}),
+    so the optimisation problems keep the same structure.
+    """
+    if dt is None:
+        dt = config.dt
+    A, B_u, _ = gen_continuous_matrices(config, gen_idx)
+    n, m = 2, 2
+    aug = np.zeros((n + 2 * m, n + 2 * m))
+    aug[:n, :n] = A * dt
+    aug[:n, n:n + m] = B_u * dt
+    aug[n:n + m, n + m:] = np.eye(m)
+    aug_d = expm(aug)
+    A_d = aug_d[:n, :n]
+    G_1 = aug_d[:n, n:n + m]
+    G_2 = aug_d[:n, n + m:]
+    return A_d, G_1 - G_2, G_2
 
 
 def gen_diff_eqs(
@@ -1097,6 +1195,40 @@ def gen_discrete_step(
     return {
         "delta_next": A_d[0][0] * delta + A_d[0][1] * omega + B_d[0][0] * P_0 + B_d[0][1] * S_re + c_d[0],
         "omega_next": A_d[1][0] * delta + A_d[1][1] * omega + B_d[1][0] * P_0 + B_d[1][1] * S_re + c_d[1],
+    }
+
+
+def gen_discrete_step_foh(
+        config: Config,
+        gen_idx: int,
+        delta: Scalar,
+        omega: Scalar,
+        S_re: Scalar,
+        S_re_next: Scalar,
+        P_0: Scalar,
+        dt: float | None = None
+    ) -> Dict[str, Scalar]:
+    """
+    One exact first-order-hold step of the generator swing dynamics:
+        [delta_next, omega_next] = A_d [delta, omega] + B_0 [P_0, S_re] + B_1 [P_0, S_re_next]
+    i.e. the electrical power is interpolated linearly from S_re at the start of
+    the step to S_re_next at its end (the mechanical power P_0 is constant, so
+    it appears in both terms). omega is the speed deviation omega_abs - omega_s
+    [rad/s]. Works with floats and casadi symbols.
+
+    This is what the solvers use: during a fault P_e changes far too quickly for
+    a zero-order hold to track at dt = 0.05 s (see gen_discrete_dynamics_foh).
+    """
+    A_d, B_0, B_1 = gen_discrete_dynamics_foh(config, gen_idx, dt)
+    A_d, B_0, B_1 = A_d.tolist(), B_0.tolist(), B_1.tolist()
+
+    return {
+        "delta_next": (A_d[0][0] * delta + A_d[0][1] * omega
+                       + B_0[0][0] * P_0 + B_0[0][1] * S_re
+                       + B_1[0][0] * P_0 + B_1[0][1] * S_re_next),
+        "omega_next": (A_d[1][0] * delta + A_d[1][1] * omega
+                       + B_0[1][0] * P_0 + B_0[1][1] * S_re
+                       + B_1[1][0] * P_0 + B_1[1][1] * S_re_next),
     }
 
 

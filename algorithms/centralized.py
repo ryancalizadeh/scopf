@@ -4,7 +4,7 @@ import casadi as ca
 from Config import Config
 from Trajectory import Trajectory
 from algorithms.base import SolveResult
-from algorithms.common import gen_alg_eqs, gen_discrete_step, gen_coi_angle, DELTA_COI_MAX
+from algorithms.common import gen_alg_eqs, gen_discrete_step_foh, gen_coi_angle, DELTA_COI_MAX
 
 
 def solve(config: Config) -> SolveResult:
@@ -13,10 +13,15 @@ def solve(config: Config) -> SolveResult:
 
     Time step n = 0 is the pre-disturbance steady state and carries the usual
     OPF constraints (P/Q limits, voltage bounds, line flows, slack reference).
-    For n >= 1 every load is scaled by config.load_step_factor and the system
-    evolves according to the classical generator model (see algorithms.common),
-    discretized exactly with a zero-order hold. The dispatch is required to
-    keep |delta_i - delta_coi| <= 100 deg over the whole horizon.
+    The contingency is a bolted fault on config.fault_line, applied from n = 1
+    and cleared at config.t_clear by tripping that line, so the network
+    admittance follows config.Y_at(n). For n >= 1 the loads are constant
+    impedances folded into that admittance (a constant-power load cannot be
+    served at the depressed voltages of a fault), which is why the load buses
+    carry no device injection there. The generators follow the classical model
+    (see algorithms.common) discretized with the exact first-order hold. The
+    dispatch is required to keep |delta_i - delta_coi| <= 100 deg over the whole
+    horizon.
 
     The "omega" variable/trajectory key is the rotor speed deviation from
     synchronous speed (omega_abs - omega_s, rad/s), so the steady state is 0.
@@ -36,7 +41,6 @@ def solve(config: Config) -> SolveResult:
     P_min = config.P_min
     Q_max = config.Q_max
     Q_min = config.Q_min
-    load_step_factor = config.load_step_factor
 
     start = time.perf_counter()
 
@@ -56,20 +60,29 @@ def solve(config: Config) -> SolveResult:
     opti.minimize(sum(costs[i] * P[i, 0]**2 for i in range(n_gens)))
 
     for n in range(N):
-        # Network equations
-        opti.subject_to(I_re[:, n] == G @ V_re[:, n] - B @ V_im[:, n])
-        opti.subject_to(I_im[:, n] == B @ V_re[:, n] + G @ V_im[:, n])
+        # Network equations, with the admittance following the fault schedule:
+        # pre-fault at n = 0, faulted while the fault is on, post-fault (the
+        # faulted line tripped) after clearing.
+        Y_n = np.asarray(config.Y_at(n))
+        G_n, B_n = np.real(Y_n), np.imag(Y_n)
+        opti.subject_to(I_re[:, n] == G_n @ V_re[:, n] - B_n @ V_im[:, n])
+        opti.subject_to(I_im[:, n] == B_n @ V_re[:, n] + G_n @ V_im[:, n])
 
         # Hyperbola constraints
         for k in range(n_buses):
             opti.subject_to(P[k, n] == V_re[k, n] * I_re[k, n] + V_im[k, n] * I_im[k, n])
             opti.subject_to(Q[k, n] == V_im[k, n] * I_re[k, n] - V_re[k, n] * I_im[k, n])
 
-        # Load equality constraints (load step disturbance for n >= 1)
-        load_scale = 1.0 if n == 0 else load_step_factor
+        # Load buses: constant power in the pre-disturbance steady state; for
+        # n >= 1 the load is a constant impedance inside Y_at(n), so the device
+        # itself injects nothing on top of the network.
         for k in range(n_gens, n_gens + n_loads):
-            opti.subject_to(P[k, n] == -load_scale * load_P[k - n_gens])
-            opti.subject_to(Q[k, n] == -load_scale * load_Q[k - n_gens])
+            if n == 0:
+                opti.subject_to(P[k, n] == -load_P[k - n_gens])
+                opti.subject_to(Q[k, n] == -load_Q[k - n_gens])
+            else:
+                opti.subject_to(I_re[k, n] == 0)
+                opti.subject_to(I_im[k, n] == 0)
 
         # Empty bus constraints
         for k in range(n_gens + n_loads, n_buses):
@@ -93,11 +106,14 @@ def solve(config: Config) -> SolveResult:
             for i in range(n_gens):
                 opti.subject_to(opti.bounded(-DELTA_COI_MAX, delta[i, n] - delta_coi, DELTA_COI_MAX))
 
-    # Generator differential equations (exact ZOH discretization)
-    # Mechanical power P_0 is the pre-disturbance dispatch P[i, 0]
+    # Generator differential equations (exact first-order hold: the electrical
+    # power is interpolated linearly across each step, which a fault transient
+    # needs at dt = 0.05 s). Mechanical power P_0 is the dispatch P[i, 0].
     for n in range(N - 1):
         for i in range(n_gens):
-            step = gen_discrete_step(config, i, delta[i, n], omega[i, n], P[i, n], P[i, 0])
+            step = gen_discrete_step_foh(
+                config, i, delta[i, n], omega[i, n], P[i, n], P[i, n + 1], P[i, 0]
+            )
             opti.subject_to(delta[i, n + 1] == step["delta_next"])
             opti.subject_to(omega[i, n + 1] == step["omega_next"])
 

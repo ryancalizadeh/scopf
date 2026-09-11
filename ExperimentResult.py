@@ -13,6 +13,10 @@ class ExperimentResult:
     runtime: float
     p_residual: Optional[float]
     s_residual: Optional[float]
+    # Reactive dispatch Q(0) at the generator buses (same order as dispatch).
+    # Together with dispatch it fixes the pre-disturbance operating point, so
+    # plot_dynamics.py can re-simulate the transient from the stored results.
+    dispatch_Q: Optional[np.ndarray] = None
 
     def __eq__(self, other):
         if not isinstance(other, ExperimentResult):

@@ -12,7 +12,7 @@ def generate_configs():
 
     # Experiment 1:
     exp1_configs = {}
-    n_buses_list = [5, 8, 15]
+    n_buses_list = [5, 15, 45, 105]
     avg_degrees = 2.0
 
     for n_buses in n_buses_list:

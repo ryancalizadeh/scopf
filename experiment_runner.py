@@ -1,4 +1,5 @@
 from typing import Dict, List
+import numpy as np
 from Config import Config
 from ExperimentResult import ExperimentResult
 from algorithms import ALGORITHMS
@@ -35,6 +36,8 @@ def experiment_runner(config: Config, n_runs: int = 6, plot_convergence_flag: bo
                     runtime=sol.runtime,
                     p_residual=sol.p_residual,
                     s_residual=sol.s_residual,
+                    dispatch_Q=(np.imag(sol.trajectory["s"][0, :config.n_gens])
+                                if sol.trajectory is not None else None),
                 ))
                 logger.debug(f"Run {i + 1}/{n_runs} for {name} completed in {sol.runtime:.2f} seconds with objective {sol.obj} and primal residual {sol.p_residual}.")
 
