@@ -61,12 +61,21 @@ def solve(config: Config) -> SolveResult:
 
     for n in range(N):
         # Network equations, with the admittance following the fault schedule:
-        # pre-fault at n = 0, faulted while the fault is on, post-fault (the
-        # faulted line tripped) after clearing.
+        # pre-fault at n = 0, loads folded in for n >= 1, post-fault (the
+        # faulted line tripped) after clearing. While the bolted fault is on,
+        # the faulted bus is pinned to V = 0 instead of its network row; its
+        # device current is then the generator's fault current, fixed by the
+        # rotor equation below.
         Y_n = np.asarray(config.Y_at(n))
         G_n, B_n = np.real(Y_n), np.imag(Y_n)
-        opti.subject_to(I_re[:, n] == G_n @ V_re[:, n] - B_n @ V_im[:, n])
-        opti.subject_to(I_im[:, n] == B_n @ V_re[:, n] + G_n @ V_im[:, n])
+        rows = config.network_buses_at(n)
+        net_re = G_n @ V_re[:, n] - B_n @ V_im[:, n]
+        net_im = B_n @ V_re[:, n] + G_n @ V_im[:, n]
+        opti.subject_to(I_re[rows, n] == net_re[rows])
+        opti.subject_to(I_im[rows, n] == net_im[rows])
+        if config.is_fault_step(n):
+            opti.subject_to(V_re[config.fault_bus, n] == 0)
+            opti.subject_to(V_im[config.fault_bus, n] == 0)
 
         # Hyperbola constraints
         for k in range(n_buses):

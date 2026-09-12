@@ -14,8 +14,10 @@ models, using only the discretized dynamics and the network equations:
      (omega is the speed deviation), mechanical power P_0 = P(0);
   3. for n >= 1: advance the rotors with the exact first-order-hold map
      (algorithms.common.gen_discrete_step_foh) and solve the network for V(n)
-     with the admittance of config.Y_at(n) (pre-fault, faulted, or post-fault)
-     and the generators represented by E e^{j delta(n)} behind Xd.
+     with the admittance of config.Y_at(n) (loads folded in; faulted line
+     tripped after clearing) and the generators represented by E e^{j delta(n)}
+     behind Xd. While the bolted fault is on, the faulted bus is pinned to
+     V = 0 and its generator delivers the fault current E e^{j delta} / (j Xd).
 
 For n >= 1 the loads are constant impedances inside Y_at(n), so the network is
 *linear* in V and is solved directly; only the pre-disturbance step needs the
@@ -110,13 +112,18 @@ class _InitialStateSolver:
         return V, I, mismatch
 
 
-def _solve_network(config: Config, Y: np.ndarray, E: np.ndarray, delta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _solve_network(config: Config, Y: np.ndarray, E: np.ndarray, delta: np.ndarray,
+                   fault_on: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """
     Solves the transient network for V, given the generator internal voltages
     E e^{j delta}. With constant-impedance loads folded into Y the system is
     linear: I = Y V everywhere, and at a generator bus
         E e^{j delta} = V + j Xd I  =>  (j Xd Y + e_i^T) V = E e^{j delta}.
     Every other bus contributes its row of I - Y V = 0 (zero injection).
+
+    While the bolted fault is on, the faulted bus is pinned to V = 0 instead of
+    its network row, and its device current is the generator's fault current
+    from the rotor equation, I = E e^{j delta} / (j Xd).
     """
     nb, ng = config.n_buses, config.n_gens
     Y = np.asarray(Y, dtype=complex)
@@ -128,8 +135,65 @@ def _solve_network(config: Config, Y: np.ndarray, E: np.ndarray, delta: np.ndarr
         A[i, :] = 1j * float(config.Xd[i]) * Y[i, :]
         A[i, i] += 1.0
         b[i] = E[i] * np.exp(1j * delta[i])
+    if fault_on:
+        k = config.fault_bus
+        A[k, :] = 0.0
+        A[k, k] = 1.0
+        b[k] = 0.0
     V = np.linalg.solve(A, b)
-    return V, Y @ V
+    I = Y @ V
+    if fault_on:
+        k = config.fault_bus
+        I[k] = E[k] * np.exp(1j * delta[k]) / (1j * float(config.Xd[k]))
+    return V, I
+
+
+def peak_coi_angle_deg(config: Config, traj: Trajectory) -> float:
+    """Largest |delta_i(t) - delta_coi(t)| over the trajectory, in degrees."""
+    d = np.asarray(traj["delta"], dtype=float)
+    w = np.asarray(config.M, dtype=float) / float(np.sum(config.M))
+    return float(np.rad2deg(np.abs(d - (d @ w)[:, None]).max()))
+
+
+def stabilise_dispatch(config: Config, P0: np.ndarray, Q0: np.ndarray, margin_deg: float = 90.0):
+    """
+    Makes a dispatch transiently stable by moving the smallest fraction alpha of
+    the faulted generator's output onto the other generators (in proportion to
+    their headroom) such that the simulated peak angle to the COI stays below
+    margin_deg. Bisection on alpha, each trial one forward simulation.
+    Returns (P, alpha, trajectory). alpha = 0 if P0 is already stable enough.
+
+    Used to warm-start ADMM: from a flat start the splitting locks the faulted
+    generator's P(0) in early and the rho ramp freezes it (the projection keeps
+    only ~3 % of an economic push on P(0), because moving dispatch drags every
+    machine's transient by ~T^2/2M), and from a transiently unstable start the
+    first projections overshoot; a start that is both economic and stable is the
+    one starting point the iteration converges from to a near-optimal dispatch.
+    """
+    ng, k = config.n_gens, config.fault_bus
+    P0 = np.asarray(P0, dtype=float); Q0 = np.asarray(Q0, dtype=float)
+
+    def shifted(alpha: float) -> np.ndarray:
+        P = P0.copy()
+        moved = alpha * P[k]
+        P[k] -= moved
+        others = [i for i in range(ng) if i != k]
+        room = np.maximum(np.asarray(config.P_max)[others] - P[others], 1e-9)
+        P[others] += moved * room / room.sum()
+        return P
+
+    traj = simulate_dispatch(config, P0, Q0)
+    if peak_coi_angle_deg(config, traj) <= margin_deg:
+        return P0, 0.0, traj
+    lo, hi = 0.0, 1.0
+    for _ in range(12):
+        mid = 0.5 * (lo + hi)
+        if peak_coi_angle_deg(config, simulate_dispatch(config, shifted(mid), Q0)) <= margin_deg:
+            hi = mid
+        else:
+            lo = mid
+    P = shifted(hi)
+    return P, hi, simulate_dispatch(config, P, Q0)
 
 
 def simulate_dispatch(config: Config, P0: np.ndarray, Q0: np.ndarray, return_info: bool = False):
@@ -172,14 +236,15 @@ def simulate_dispatch(config: Config, P0: np.ndarray, Q0: np.ndarray, return_inf
                 step = gen_discrete_step_foh(config, i, delta[n, i], omega[n, i], P_e[i], P_e_next[i], P_mech[i])
                 delta[n + 1, i] = step["delta_next"]
                 omega[n + 1, i] = step["omega_next"]
-            V[n + 1], I[n + 1] = _solve_network(config, Y_next, E, delta[n + 1])
+            V[n + 1], I[n + 1] = _solve_network(config, Y_next, E, delta[n + 1], fault_on=config.is_fault_step(n + 1))
             updated = np.real(V[n + 1, :ng] * np.conj(I[n + 1, :ng]))
             converged = np.abs(updated - P_e_next).max() < 1e-11
             P_e_next = updated
             if converged:
                 break
         max_fixed_point_iters = max(max_fixed_point_iters, iteration + 1)
-        residual = np.abs(I[n + 1] - Y_next @ V[n + 1]).max()
+        rows = config.network_buses_at(n + 1)
+        residual = np.abs(I[n + 1][rows] - (Y_next @ V[n + 1])[rows]).max()
         max_net_residual = max(max_net_residual, float(residual))
         P_e = P_e_next
 

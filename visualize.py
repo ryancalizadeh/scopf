@@ -50,7 +50,8 @@ def plot_convergence(history: ConvergenceHistory, title: str = "ADMM convergence
     ax.set_yscale("log")
     ax.set_title(title)
     ax.legend()
-    return fig
+    fig.savefig(f"results/{title.replace(' ', '_')}.png")
+    # return fig
 
 
 def print_dispatch_comparison(aggregated: Dict[str, AggregatedResult], reference: str = "centralized"):

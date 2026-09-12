@@ -192,9 +192,11 @@ class Generator(Proxable):
     and f = ind_B + ind_V_bb, so prox_{rho, f} = proj_(B cap V_bb)
     The projection operator is computed using casadi and IPOPT, and is set up once. Previous solutions are used to warmstart the solver for the next iteration.
     Since this prox reduces to a pure projection, rho is ignored.
+
     """
 
-    def __init__(self, config: Config, bus_index: int, gen_index: int, max_iter=500, tol=1e-8):
+    def __init__(self, config: Config, bus_index: int, gen_index: int, max_iter=500, tol=1e-8,
+                 angle_weight: float = 1.0):
         self.config = config
         self.bus_index = bus_index
         self.gen_index = gen_index
@@ -203,6 +205,15 @@ class Generator(Proxable):
 
         V_min = float(config.V_min[bus_index])
         V_max = float(config.V_max[bus_index])
+        # Weight of the rotor-state terms in the projection metric. Keep it at
+        # 1 (plain Euclidean metric): down-weighting delta/omega, i.e. running
+        # ADMM on rescaled rotor states so that the prox stops trading P(0) for
+        # angle fit under light inertia, was tested on 2026-09-11 and does not
+        # help. A weight of 0.09 changed nothing (dispatch error unchanged at
+        # 50%), 0.01 and 1e-3 made the iteration diverge: the cheap angles
+        # wander per iteration and the rotor equation, nonconvex in delta,
+        # then wrecks the V/I fit.
+        self.angle_weight = float(angle_weight)
 
         opti = ca.Opti()
         self.V_re = opti.variable(N)
@@ -228,7 +239,7 @@ class Generator(Proxable):
             ca.sumsqr(self.V_re - self.v0r) + ca.sumsqr(self.V_im - self.v0i)
             + ca.sumsqr(self.I_re - self.i0r) + ca.sumsqr(self.I_im - self.i0i)
             + ca.sumsqr(self.P - self.p0) + ca.sumsqr(self.Q - self.q0)
-            + ca.sumsqr(self.delta - self.d0) + ca.sumsqr(self.omega - self.w0)
+            + self.angle_weight * (ca.sumsqr(self.delta - self.d0) + ca.sumsqr(self.omega - self.w0))
         )
 
         for n in range(N):
@@ -399,12 +410,22 @@ class FCvxpy(Proxable):
             Q[:n_gens, 0] <= config.Q_max,
         ]
 
-        # Network equations, with the admittance following the fault schedule
+        # Network equations, with the admittance following the fault schedule;
+        # while the fault is on the faulted bus is pinned to V = 0 instead of
+        # its network row (its device current is the free fault current).
         for n in range(self.N):
             Y_n = np.asarray(config.Y_at(n))
             G_n, B_n = np.real(Y_n), np.imag(Y_n)
-            constraints.append(I_re[:, n] == G_n @ V_re[:, n] - B_n @ V_im[:, n])
-            constraints.append(I_im[:, n] == B_n @ V_re[:, n] + G_n @ V_im[:, n])
+            rows = config.network_buses_at(n)
+            constraints.append(I_re[rows, n] == (G_n @ V_re[:, n] - B_n @ V_im[:, n])[rows])
+            constraints.append(I_im[rows, n] == (B_n @ V_re[:, n] + G_n @ V_im[:, n])[rows])
+            if config.is_fault_step(n):
+                constraints.append(V_re[config.fault_bus, n] == 0)
+                constraints.append(V_im[config.fault_bus, n] == 0)
+
+        # Voltage upper bound at t = 0 (second-order cones); the lower bound is
+        # nonconvex and lives in the per-bus projections only.
+        constraints.append(cp.norm(cp.vstack([V_re[:, 0], V_im[:, 0]]), 2, axis=0) <= np.asarray(config.V_max, dtype=float))
 
         # Line flow limits at t = 0 (second-order cones)
         for k in range(n_buses):
@@ -470,10 +491,18 @@ class F(Proxable):
         P_{min, i} <= P_i(0) <= P_{max, i},
         Q_{min, i} <= Q_i(0) <= Q_{max, i},
         |I_{kl}(0)| <= I_{kl}^{max} for all lines (k, l),
+        |V_k(0)| <= V_{max, k} for all buses k,
         |delta_i(t) - delta_coi(t)| <= 100 deg for all t,
     }
     omega (the rotor speed deviation omega_abs - omega_s) is unconstrained by f, so its prox is the
     identity.
+
+    The voltage upper bound is deliberately in f as well as in the per-bus projections: when the
+    OPF optimum sits on V_max (which the fault contingency makes common), a splitting in which
+    only the projections know the bound never reaches consensus, because f keeps pulling the
+    voltage past the limit while the projections keep clamping it. With the bound on both sides
+    the two proxes agree. The lower bound |V_k(0)| >= V_min is nonconvex, so it cannot be part of
+    the convex f and remains in the projections only.
 
     prox_{rho, f}(z) = argmin_w f(w) + rho/2 ||w - z||^2 separates over time steps and, within a
     time step, over the independent variable groups, so it is evaluated block by block:
@@ -484,10 +513,10 @@ class F(Proxable):
                            (economic QR). One basis per fault phase is computed at setup and the
                            steps of each phase go through a single matrix product.
       (V_0, I_0)         : same with the slack row Im V_0(0) = 0 appended (basis Q_0). If the projected
-                           point satisfies every line limit |I_kl(0)| <= I_max it is also the projection
-                           onto the intersection with the line-flow cones, so the cone program is only
-                           solved (small DPP cvxpy SOCP in 4 n_buses variables, built lazily) when a
-                           line limit is violated.
+                           point satisfies every line limit |I_kl(0)| <= I_max and every voltage bound
+                           |V_k(0)| <= V_max it is also the projection onto the intersection with those
+                           cones, so the cone program is only solved (small DPP cvxpy SOCP in 4 n_buses
+                           variables, built lazily) when a limit is violated.
       S_0 at generators  : 1-D closed form: P = clip(rho z_P / (2 c_i + rho), P_min, P_max), Q = clip(z_Q,
                            Q_min, Q_max) (the clipped unconstrained minimiser is exact for a convex
                            1-D quadratic on an interval); every other S entry is the identity.
@@ -509,20 +538,21 @@ class F(Proxable):
         B = np.asarray(config.B, dtype=float)
         self.G, self.B = G, B
 
-        # One network-subspace basis per fault phase. Steps sharing an
-        # admittance matrix share a basis, so the projection of each phase is a
+        # One network-subspace basis per fault phase. Steps sharing the same
+        # constraint rows share a basis, so the projection of each phase is a
         # single matrix product. Phases: t = 0 (pre-fault, with the slack row),
-        # 1 <= t <= n_clear (faulted), t > n_clear (post-fault).
+        # 1 <= t <= n_clear (fault on: the faulted bus's network row is replaced
+        # by V = 0 there), t > n_clear (post-fault, line tripped).
         slack_row = np.zeros((1, 4 * nb))
         slack_row[0, nb] = 1.0  # V_im[0]
         self.Q0 = self._range_basis(np.vstack([self._network_rows(config.Y_at(0)), slack_row]))
         self._phase_bases = {}
         self._phase_of_step = np.zeros(N, dtype=int)
         for n in range(1, N):
-            phase = 1 if n <= config.n_clear else 2
+            phase = 1 if config.is_fault_step(n) else 2
             self._phase_of_step[n] = phase
             if phase not in self._phase_bases:
-                self._phase_bases[phase] = self._range_basis(self._network_rows(config.Y_at(n)))
+                self._phase_bases[phase] = self._range_basis(self._constraint_rows_at(n))
 
         lines = [(k, l, G[k, l], B[k, l]) for k in range(nb) for l in range(k + 1, nb)
                  if G[k, l] != 0 or B[k, l] != 0]
@@ -531,6 +561,7 @@ class F(Proxable):
         self.line_G = np.array([g for _, _, g, _ in lines], dtype=float)
         self.line_B = np.array([b for _, _, _, b in lines], dtype=float)
         self.line_limit = float(config.line_flow_limits)
+        self.V_max = np.asarray(config.V_max, dtype=float)
 
         self.costs = np.asarray(config.costs, dtype=float)
         self.P_min = np.asarray(config.P_min, dtype=float)
@@ -541,7 +572,7 @@ class F(Proxable):
         M = np.asarray(config.M, dtype=float)
         self.coi_w = M / M.sum()
         self._coi_qp = self._build_coi_qp() if ng > 1 else None
-        self._t0_socp = None  # built on first line-limit violation
+        self._t0_socp = None  # built on the first line-limit or voltage-bound violation
 
         self.n_socp_fallbacks = 0
         self.n_coi_projections = 0
@@ -558,6 +589,25 @@ class F(Proxable):
         I_nb = np.eye(nb)
         Z_nb = np.zeros((nb, nb))
         return np.block([[G, -B, -I_nb, Z_nb], [B, G, Z_nb, -I_nb]])
+
+    def _constraint_rows_at(self, n: int) -> np.ndarray:
+        """
+        Linear network constraints of step n >= 1 as rows in x = [V_re; V_im; I_re; I_im]:
+        I_k = (Y V)_k for every bus k of config.network_buses_at(n), plus, while
+        the fault is on, V_re = V_im = 0 at the faulted bus (whose own network
+        row is dropped: its device current is the free fault current). The row
+        count is always 2 n_buses and the rows are independent.
+        """
+        nb = self.n_buses
+        rows = self._network_rows(self.config.Y_at(n))
+        if not self.config.is_fault_step(n):
+            return rows
+        k = self.config.fault_bus
+        keep = [r for r in range(2 * nb) if r not in (k, nb + k)]
+        pin = np.zeros((2, 4 * nb))
+        pin[0, k] = 1.0        # V_re[k] = 0
+        pin[1, nb + k] = 1.0   # V_im[k] = 0
+        return np.vstack([rows[keep], pin])
 
     @staticmethod
     def _range_basis(A: np.ndarray) -> np.ndarray:
@@ -589,6 +639,9 @@ class F(Proxable):
             I_re == G @ V_re - B @ V_im,
             I_im == B @ V_re + G @ V_im,
             V_im[0] == 0,
+            # Voltage upper bound |V_k(0)| <= V_max,k (second-order cones). The
+            # lower bound is nonconvex and stays in the per-bus projections.
+            cp.norm(cp.vstack([V_re, V_im]), 2, axis=0) <= self.V_max,
         ]
         for k, l, g, b in zip(self.line_k, self.line_l, self.line_G, self.line_B):
             I_re_kl = -(V_re[k] - V_re[l]) * g + (V_im[k] - V_im[l]) * b
@@ -618,14 +671,25 @@ class F(Proxable):
         if problem.status not in ("optimal", "optimal_inaccurate"):
             raise ValueError(f"F.prox {what} did not converge: {problem.status}")
 
+    def _voltage_magnitudes(self, x0: np.ndarray) -> np.ndarray:
+        nb = self.n_buses
+        return np.hypot(x0[:nb], x0[nb:2 * nb])
+
     def _project_t0(self, x0_raw: np.ndarray) -> np.ndarray:
         x0 = self._project_network(x0_raw[:, None], self.Q0)[:, 0]
-        if self.line_k.size and np.any(self._line_currents(x0) > self.line_limit * (1 + 1e-9) + 1e-12):
+        # The subspace projection is also the projection onto the intersection
+        # with the line-flow and voltage cones whenever it already satisfies
+        # them; otherwise the small SOCP is needed.
+        lines_ok = not self.line_k.size or not np.any(
+            self._line_currents(x0) > self.line_limit * (1 + 1e-9) + 1e-12
+        )
+        voltage_ok = not np.any(self._voltage_magnitudes(x0) > self.V_max * (1 + 1e-9) + 1e-12)
+        if not (lines_ok and voltage_ok):
             if self._t0_socp is None:
                 self._t0_socp = self._build_t0_socp()
             problem, x, z = self._t0_socp
             z.value = x0_raw
-            self._solve_small(problem, "t=0 line-flow SOCP")
+            self._solve_small(problem, "t=0 SOCP (line flows / voltage bound)")
             x0 = np.asarray(x.value, dtype=float)
             self.n_socp_fallbacks += 1
         return x0

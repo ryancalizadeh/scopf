@@ -16,7 +16,7 @@ def generate_configs():
     avg_degrees = 2.0
 
     for n_buses in n_buses_list:
-        config = Config(n_buses=n_buses, gen_ratio=gen_ratio, load_ratio=load_ratios, avg_degree=avg_degrees)
+        config = Config(n_buses=n_buses, gen_ratio=gen_ratio, load_ratio=load_ratios, avg_degree=avg_degrees, T=1.2, dt=0.1)
         exp1_configs[f"exp1_n_buses_{n_buses}"] = config
 
     # # Experiment 2:

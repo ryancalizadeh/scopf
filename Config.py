@@ -41,9 +41,8 @@ class Config:
     Y_post: np.ndarray
 
     def __init__(self, n_buses: int, gen_ratio: float, load_ratio: float, avg_degree: float,
-                 T: float = 2.0, dt: float = 0.05, load_step_factor: float = 1.0,
-                 load_fraction: float = 0.3, t_clear: float = 0.6,
-                 fault_shunt: complex = -1e3j):
+                 T: float = 2.0, dt: float = 0.1, load_step_factor: float = 1.0,
+                 load_fraction: float = 0.3, t_clear: float = 0.6):
         rng = np.random.default_rng(seed=42)  # For reproducibility
         self.T = T
         self.dt = dt
@@ -90,11 +89,13 @@ class Config:
 
         self.line_flow_limits = 1.0  # This can be adjusted as needed
 
-        # Contingency: a bolted fault on a randomly chosen line, applied from
-        # the first time step and cleared at t_clear by tripping that line.
+        # Contingency: a bolted fault at the generator end of a randomly chosen
+        # line, applied from the first time step and cleared at t_clear by
+        # tripping that line. The fault is exact (V = 0 at the faulted bus, see
+        # is_fault_step); it is NOT a large shunt admittance inside Y, which
+        # would make the ADMM consensus metric meaningless at that bus.
         self.t_clear = t_clear
         self.n_clear = int(round(t_clear / dt))
-        self.fault_shunt = fault_shunt
         self._setup_fault(rng)
 
     # ------------------------------------------------------------------
@@ -103,14 +104,24 @@ class Config:
 
     def _setup_fault(self, rng) -> None:
         """
-        Picks the faulted line and builds the three admittance matrices used by
-        the transient: Y_bus (pre-disturbance), Y_fault (fault on) and Y_post
+        Picks the faulted line and builds the admittance matrices used by the
+        transient: Y_bus (pre-disturbance), Y_fault (fault on) and Y_post
         (fault cleared by tripping the line).
+
+        The bolted fault itself is the constraint V = 0 at fault_bus during the
+        fault steps (is_fault_step). At that bus the network row I = (Y V) is
+        dropped for those steps and the device current is free: it is the
+        generator's fault current, fixed by its rotor equation
+        E e^{j delta} = j Xd I. Y_fault therefore equals Y_transient. (An
+        earlier version added a 1e3 shunt to Y instead; that is equivalent in
+        the limit but makes a 1e-4 voltage disagreement between the ADMM
+        proxes a 0.1 p.u. current disagreement, so consensus became
+        meaningless at the faulted bus.)
 
         For t >= 1 the loads are represented as constant impedances folded into
         the admittance matrix, so that the network stays solvable at the
         depressed voltages of a fault (constant-power loads cannot be served at
-        |V| ~ 0.01). The load current is unchanged in magnitude: the term
+        |V| ~ 0). The load current is unchanged in magnitude: the term
         y_L * V inside Y_transient @ V carries exactly what the load device drew
         before, so what becomes zero for t >= 1 is only the *residual* device
         injection I - Y_transient @ V at that bus.
@@ -133,9 +144,9 @@ class Config:
             Y_transient[bus, bus] += self.load_P[idx] - 1j * self.load_Q[idx]
         self.Y_transient = Y_transient
 
-        # Fault on: a large shunt at the faulted end of the line.
+        # Fault on: the network is unchanged; the fault is the V = 0 constraint
+        # at fault_bus (see is_fault_step / network_rows_at).
         self.Y_fault = Y_transient.copy()
-        self.Y_fault[fault_bus, fault_bus] += self.fault_shunt
 
         # Fault cleared: the faulted line is removed.
         self.Y_post = Y_transient.copy()
@@ -187,6 +198,20 @@ class Config:
         if n == 0:
             return self.Y_bus
         return self.Y_fault if n <= self.n_clear else self.Y_post
+
+    def is_fault_step(self, n: int) -> bool:
+        """True while the bolted fault is on (V = 0 at fault_bus): 1 <= n <= n_clear."""
+        return 1 <= n <= self.n_clear
+
+    def network_buses_at(self, n: int) -> list:
+        """
+        Buses whose network equation I_k = (Y_at(n) V)_k holds at step n. During
+        the fault the faulted bus is excluded: its voltage is pinned to zero
+        instead and its device current (the generator's fault current) is free.
+        """
+        if self.is_fault_step(n):
+            return [k for k in range(self.n_buses) if k != self.fault_bus]
+        return list(range(self.n_buses))
 
     def load_admittance(self) -> np.ndarray:
         """
