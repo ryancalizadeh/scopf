@@ -1,4 +1,5 @@
 import os
+import logging
 import queue
 import threading
 import multiprocessing
@@ -14,6 +15,9 @@ from Config import Config
 Scalar = Any
 from Trajectory import Trajectory
 from Proxable import Proxable
+from algorithms.metric import LeverageMetric, inner
+
+logger = logging.getLogger(__name__)
 
 
 # Transient stability limit on the rotor angle relative to the centre of inertia
@@ -193,10 +197,13 @@ class Generator(Proxable):
     The projection operator is computed using casadi and IPOPT, and is set up once. Previous solutions are used to warmstart the solver for the next iteration.
     Since this prox reduces to a pure projection, rho is ignored.
 
+    The projection is taken in the rank-one leverage metric of algorithms.metric when one is set
+    (set_metric): ||w - z||_M^2 = ||w - z||^2 - alpha (d^T (w - z))^2 with d the unit response of
+    the Euclidean projection to a push on P(0) (leverage_direction). With alpha = 0 (the default)
+    this is the plain Euclidean projection.
     """
 
-    def __init__(self, config: Config, bus_index: int, gen_index: int, max_iter=500, tol=1e-8,
-                 angle_weight: float = 1.0):
+    def __init__(self, config: Config, bus_index: int, gen_index: int, max_iter=500, tol=1e-8):
         self.config = config
         self.bus_index = bus_index
         self.gen_index = gen_index
@@ -205,15 +212,6 @@ class Generator(Proxable):
 
         V_min = float(config.V_min[bus_index])
         V_max = float(config.V_max[bus_index])
-        # Weight of the rotor-state terms in the projection metric. Keep it at
-        # 1 (plain Euclidean metric): down-weighting delta/omega, i.e. running
-        # ADMM on rescaled rotor states so that the prox stops trading P(0) for
-        # angle fit under light inertia, was tested on 2026-09-11 and does not
-        # help. A weight of 0.09 changed nothing (dispatch error unchanged at
-        # 50%), 0.01 and 1e-3 made the iteration diverge: the cheap angles
-        # wander per iteration and the rotor equation, nonconvex in delta,
-        # then wrecks the V/I fit.
-        self.angle_weight = float(angle_weight)
 
         opti = ca.Opti()
         self.V_re = opti.variable(N)
@@ -235,12 +233,20 @@ class Generator(Proxable):
         self.d0 = opti.parameter(N)
         self.w0 = opti.parameter(N)
 
-        opti.minimize(
-            ca.sumsqr(self.V_re - self.v0r) + ca.sumsqr(self.V_im - self.v0i)
-            + ca.sumsqr(self.I_re - self.i0r) + ca.sumsqr(self.I_im - self.i0i)
-            + ca.sumsqr(self.P - self.p0) + ca.sumsqr(self.Q - self.q0)
-            + self.angle_weight * (ca.sumsqr(self.delta - self.d0) + ca.sumsqr(self.omega - self.w0))
+        # Leverage metric: unit direction (same 8 blocks as the variables) and alpha.
+        self.md = tuple(opti.parameter(N) for _ in range(8))
+        self.malpha = opti.parameter()
+        # Per-time-step weights of the prox term (set_time_weights); 1 = Euclidean.
+        self.mw = opti.parameter(N)
+
+        deviations = (
+            self.V_re - self.v0r, self.V_im - self.v0i,
+            self.I_re - self.i0r, self.I_im - self.i0i,
+            self.P - self.p0, self.Q - self.q0,
+            self.delta - self.d0, self.omega - self.w0,
         )
+        along_d = sum(ca.dot(dk, dev) for dk, dev in zip(self.md, deviations))
+        opti.minimize(sum(ca.dot(self.mw, dev**2) for dev in deviations) - self.malpha * along_d**2)
 
         for n in range(N):
             # Hyperbola constraints: S = V conj(I)
@@ -277,16 +283,73 @@ class Generator(Proxable):
         self._warm = None
         self.E = None
         self.n_failures = 0
+        self.set_metric(None, 0.0)
+        self.set_time_weights(np.ones(N))
+
+    # ------------------------------------------------------------------
+    # Metric
+    # ------------------------------------------------------------------
+
+    def set_time_weights(self, w: np.ndarray) -> None:
+        """
+        Diagonal time metric: the prox term becomes sum_t w_t ||w(t) - z(t)||^2 over all blocks.
+        A weight that is uniform within each time step leaves every per-time-step-separable prox
+        (F, loads, empty buses) unchanged, so setting it here alone is still exact metric ADMM.
+        """
+        self.time_weights = np.asarray(w, dtype=float)
+        self.opti.set_value(self.mw, self.time_weights)
+
+    @staticmethod
+    def _blocks(z: Trajectory) -> tuple:
+        """Single-bus Trajectory -> the 8 real blocks in the prox's variable order."""
+        V, I, S = z["v"][:, 0], z["i"][:, 0], z["s"][:, 0]
+        return (np.real(V), np.imag(V), np.real(I), np.imag(I), np.real(S), np.imag(S),
+                np.asarray(z["delta"][:, 0], dtype=float), np.asarray(z["omega"][:, 0], dtype=float))
+
+    @staticmethod
+    def _from_blocks(template: Trajectory, blocks: tuple) -> Trajectory:
+        V_re, V_im, I_re, I_im, P, Q, delta, omega = blocks
+        ret = template.copy()
+        ret["v"][:, 0] = V_re + 1j * V_im
+        ret["i"][:, 0] = I_re + 1j * I_im
+        ret["s"][:, 0] = P + 1j * Q
+        ret["delta"][:, 0] = delta
+        ret["omega"][:, 0] = omega
+        return ret
+
+    def set_metric(self, direction: "Trajectory | None", alpha: float) -> None:
+        """
+        direction: unit single-bus Trajectory d (None = Euclidean), alpha in [0, 1).
+        See algorithms.metric.LeverageMetric.
+        """
+        self.metric_direction = direction
+        self.metric_alpha = float(alpha)
+        blocks = self._blocks(direction) if direction is not None else tuple(np.zeros(self.N) for _ in range(8))
+        for par, val in zip(self.md, blocks):
+            self.opti.set_value(par, val)
+        self.opti.set_value(self.malpha, self.metric_alpha if direction is not None else 0.0)
+
+    def leverage_direction(self, z: Trajectory, eps: float = 1e-2) -> "tuple[Trajectory, float]":
+        """
+        Response r = (proj(z + eps e_P(0)) - proj(z)) / eps of the *Euclidean* projection to a
+        push on P(0), as a single-bus Trajectory, and its P(0) entry r_P (the pass-through).
+        The current metric is restored afterwards; the warm start is left at proj(z).
+        """
+        saved = (self.metric_direction, self.metric_alpha)
+        self.set_metric(None, 0.0)
+        try:
+            pushed = z.copy()
+            pushed["s"][0, 0] += eps
+            p1 = self.prox(pushed)
+            p0 = self.prox(z)
+        finally:
+            self.set_metric(*saved)
+        r = (p1 - p0) * (1.0 / eps)
+        return r, float(np.real(r["s"][0, 0]))
 
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        V0 = z["v"][:, 0]
-        I0 = z["i"][:, 0]
-        S0 = z["s"][:, 0]
-        d0 = z["delta"][:, 0]
-        w0 = z["omega"][:, 0]
-
+        values = self._blocks(z)
         params = (self.v0r, self.v0i, self.i0r, self.i0i, self.p0, self.q0, self.d0, self.w0)
-        values = (np.real(V0), np.imag(V0), np.real(I0), np.imag(I0), np.real(S0), np.imag(S0), d0, w0)
         for par, val in zip(params, values):
             self.opti.set_value(par, val)
 
@@ -305,15 +368,7 @@ class Generator(Proxable):
         sol_vars = tuple(np.reshape(value(var), self.N) for var in self._vars)
         self.E = float(value(self.E_var))
         self._warm = (sol_vars, self.E)
-
-        V_re, V_im, I_re, I_im, P, Q, delta, omega = sol_vars
-        ret = z.copy()
-        ret["v"][:, 0] = V_re + 1j * V_im
-        ret["i"][:, 0] = I_re + 1j * I_im
-        ret["s"][:, 0] = P + 1j * Q
-        ret["delta"][:, 0] = delta
-        ret["omega"][:, 0] = omega
-        return ret
+        return self._from_blocks(z, sol_vars)
 
 
 class EmptyBus(Proxable):
@@ -526,6 +581,20 @@ class F(Proxable):
 
     Setup cost is one QR of a (4 n_buses) x (2 n_buses + 1) matrix; the per-call cost is a few dense
     matrix products, independent of rho except for the closed-form P update.
+
+    Leverage metric (algorithms.metric.LeverageMetric, set_metric): the prox in the metric
+    M = I - sum_i alpha_i d_i d_i^T is obtained from the Euclidean one by dualising the rank-one
+    terms. Since -alpha y^2 = min_lambda (lambda y + lambda^2 / 4 alpha),
+
+        prox^M_f(z) = w*(lambda*),  w*(lambda) = prox_f(z - 1/2 sum_i lambda_i d_i),
+        lambda* = argmin Phi(lambda),  Phi convex in lambda (n_gens-dimensional),
+        stationarity: lambda_i = -2 alpha_i d_i^T (w*(lambda) - z).
+
+    The Euclidean prox is piecewise linear in z (subspace projections, clips; the cone / COI
+    fallbacks are piecewise smooth), so a semi-smooth Newton step on lambda with the Jacobian
+    D^T P D (P = the local Jacobian of prox_f, obtained by finite differences along the d_i) is
+    exact in the common case and converges in a few steps otherwise. Cost: n_gens + 2 Euclidean
+    prox calls per Newton step.
     """
 
     def __init__(self, config: Config, solver: str = "CLARABEL"):
@@ -576,6 +645,66 @@ class F(Proxable):
 
         self.n_socp_fallbacks = 0
         self.n_coi_projections = 0
+
+        self.metric = LeverageMetric.identity()
+        self._metric_dirs: dict = {}
+        self.n_metric_newton_steps: list = []  # Newton steps per metric prox call
+
+    # ------------------------------------------------------------------
+    # Leverage metric
+    # ------------------------------------------------------------------
+
+    def set_metric(self, metric: "LeverageMetric | None") -> None:
+        """Installs a LeverageMetric (None = Euclidean). Directions are stored as full-width trajectories."""
+        self.metric = metric if metric is not None else LeverageMetric.identity()
+        nb, ng, N = self.n_buses, self.n_gens, self.N
+        template = Trajectory({
+            "v": np.zeros((N, nb), dtype=complex), "i": np.zeros((N, nb), dtype=complex),
+            "s": np.zeros((N, nb), dtype=complex), "delta": np.zeros((N, ng)), "omega": np.zeros((N, ng)),
+        })
+        self._metric_dirs = {}
+        for i, d in self.metric.directions.items():
+            full = template.copy()
+            full.at_bus[i] = d
+            self._metric_dirs[i] = full
+
+    def _prox_metric(self, z: Trajectory, rho: float, max_steps: int = 8, tol: float = 1e-10) -> Trajectory:
+        gens = sorted(self._metric_dirs)
+        D = [self._metric_dirs[i] for i in gens]
+        alpha = np.array([self.metric.alphas[i] for i in gens])
+        lam = np.zeros(len(gens))
+        h = 1e-3
+
+        def shifted(lam_):
+            zp = z.copy()
+            for l_, d in zip(lam_, D):
+                if l_ != 0.0:
+                    zp = zp - d * (0.5 * l_)
+            return zp
+
+        def residual(lam_, w_):
+            return lam_ / (2.0 * alpha) + np.array([inner(d, w_ - z) for d in D])
+
+        w = self._prox_euclid(z, rho)  # = w*(lambda = 0)
+        steps = 0
+        g = residual(lam, w)
+        while np.abs(g).max() >= tol and steps < max_steps:
+            # Local Jacobian J = D^T P D by finite differences of the Euclidean
+            # prox at z'(lambda); w is already prox(z'(lambda)).
+            zp = shifted(lam)
+            J = np.empty((len(gens), len(gens)))
+            for j, dj in enumerate(D):
+                Pdj = (self._prox_euclid(zp + dj * h, rho) - w) * (1.0 / h)
+                J[:, j] = [inner(di, Pdj) for di in D]
+            H = np.diag(1.0 / (2.0 * alpha)) - 0.5 * J
+            lam = lam - np.linalg.solve(H, g)
+            w = self._prox_euclid(shifted(lam), rho)
+            g = residual(lam, w)
+            steps += 1
+        if np.abs(g).max() >= tol:
+            logger.warning(f"F metric prox: Newton on lambda stopped after {steps} steps, |g|={np.abs(g).max():.2e}")
+        self.n_metric_newton_steps.append(steps)
+        return w
 
     def _network_rows(self, Y: np.ndarray) -> np.ndarray:
         """
@@ -710,6 +839,11 @@ class F(Proxable):
         return out
 
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        if self._metric_dirs:
+            return self._prox_metric(z, rho)
+        return self._prox_euclid(z, rho)
+
+    def _prox_euclid(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
         nb, ng, N = self.n_buses, self.n_gens, self.N
         # Trajectory arrays are (N, width); work width-major here.
         V0 = z["v"].T
@@ -747,9 +881,20 @@ class F(Proxable):
         })
 
 
+def _generator_metric_args(metric: LeverageMetric, i: int) -> tuple:
+    """(direction, alpha) for Generator.set_metric of bus i (Euclidean if i is not in the metric)."""
+    if i in metric.directions:
+        return metric.directions[i], metric.alphas[i]
+    return None, 0.0
+
+
 class BusBehaviours(Proxable):
     """
     A class implementing projections onto the behaviours of a set of buses, each with its own behaviour (e.g., constant power load, generator, etc.)
+
+    leverage_directions / set_metric support the variable-metric ADMM (algorithms.metric): the
+    former measures each generator's response to a push on P(0), the latter installs the
+    resulting metric in the generator projections.
     """
     def __init__(self, behaviours: list[Proxable]):
         self.behaviours = behaviours
@@ -761,11 +906,27 @@ class BusBehaviours(Proxable):
             ret.at_bus[i] = ret_i
         return ret
 
+    def leverage_directions(self, z: Trajectory, eps: float = 1e-2) -> dict:
+        return {i: b.leverage_direction(z.at_bus[i], eps)
+                for i, b in enumerate(self.behaviours) if isinstance(b, Generator)}
+
+    def set_metric(self, metric: LeverageMetric) -> None:
+        for i, b in enumerate(self.behaviours):
+            if isinstance(b, Generator):
+                b.set_metric(*_generator_metric_args(metric, i))
+
+    def set_time_weights(self, w: np.ndarray) -> None:
+        for b in self.behaviours:
+            if isinstance(b, Generator):
+                b.set_time_weights(w)
+
 
 class _AffinityWorker(threading.Thread):
     """
     Persistent worker thread that owns a fixed subset of bus behaviours and
-    evaluates their proxes for every trajectory submitted to it.
+    evaluates their proxes for every trajectory submitted to it. Every call
+    into a behaviour (prox, leverage_direction, set_metric) goes through this
+    thread, see BusBehavioursParallel.
     """
 
     def __init__(self, behaviours: list[Proxable], indices: list[int]):
@@ -776,9 +937,15 @@ class _AffinityWorker(threading.Thread):
         self._results: "queue.Queue" = queue.Queue()
 
     def submit(self, z: Trajectory, rho: float) -> None:
-        self._tasks.put((z, rho))
+        self._tasks.put(("prox", z, rho))
 
-    def collect(self) -> list[tuple[int, Trajectory]]:
+    def submit_leverage(self, z: Trajectory, eps: float) -> None:
+        self._tasks.put(("leverage", z, eps))
+
+    def submit_metric(self, metric: LeverageMetric) -> None:
+        self._tasks.put(("set_metric", metric))
+
+    def collect(self):
         result = self._results.get()
         if isinstance(result, BaseException):
             raise result
@@ -792,9 +959,20 @@ class _AffinityWorker(threading.Thread):
             task = self._tasks.get()
             if task is None:
                 return
-            z, rho = task
             try:
-                self._results.put([(i, self.behaviours[i].prox(z.at_bus[i], rho)) for i in self.indices])
+                if task[0] == "prox":
+                    _, z, rho = task
+                    self._results.put([(i, self.behaviours[i].prox(z.at_bus[i], rho)) for i in self.indices])
+                elif task[0] == "leverage":
+                    _, z, eps = task
+                    self._results.put([(i, self.behaviours[i].leverage_direction(z.at_bus[i], eps))
+                                       for i in self.indices if isinstance(self.behaviours[i], Generator)])
+                elif task[0] == "set_metric":
+                    _, metric = task
+                    for i in self.indices:
+                        if isinstance(self.behaviours[i], Generator):
+                            self.behaviours[i].set_metric(*_generator_metric_args(metric, i))
+                    self._results.put([])
             except BaseException as exc:  # propagate to the caller instead of killing the thread
                 self._results.put(exc)
 
@@ -833,6 +1011,20 @@ class BusBehavioursParallel(Proxable):
                 ret.at_bus[i] = ret_i
         return ret
 
+    def leverage_directions(self, z: Trajectory, eps: float = 1e-2) -> dict:
+        for worker in self._workers:
+            worker.submit_leverage(z, eps)
+        out = {}
+        for worker in self._workers:
+            out.update(dict(worker.collect()))
+        return out
+
+    def set_metric(self, metric: LeverageMetric) -> None:
+        for worker in self._workers:
+            worker.submit_metric(metric)
+        for worker in self._workers:
+            worker.collect()
+
     def close(self) -> None:
         for worker in self._workers:
             worker.stop()
@@ -848,7 +1040,8 @@ def _process_worker_main(conn, config: Config, indices: list[int]) -> None:
     """
     Entry point of a bus-projection worker process. Builds the behaviours for
     its own buses (casadi objects never cross the process boundary), then
-    serves ("prox", [single-bus Trajectory, ...], rho) and ("stats",) requests
+    serves ("prox", [single-bus Trajectory, ...], rho), ("leverage", [slices],
+    eps), ("set_metric", {bus: (direction, alpha)}) and ("stats",) requests
     until it receives None.
     """
     behaviours = {i: make_bus_behaviour(config, i) for i in indices}
@@ -860,6 +1053,16 @@ def _process_worker_main(conn, config: Config, indices: list[int]) -> None:
             if msg[0] == "prox":
                 _, slices, rho = msg
                 conn.send(("ok", [behaviours[i].prox(zb, rho) for i, zb in zip(indices, slices)]))
+            elif msg[0] == "leverage":
+                _, slices, eps = msg
+                conn.send(("ok", {i: behaviours[i].leverage_direction(zb, eps)
+                                  for i, zb in zip(indices, slices) if isinstance(behaviours[i], Generator)}))
+            elif msg[0] == "set_metric":
+                _, args = msg
+                for i, b in behaviours.items():
+                    if isinstance(b, Generator):
+                        b.set_metric(*args.get(i, (None, 0.0)))
+                conn.send(("ok", None))
             elif msg[0] == "stats":
                 conn.send(("ok", {
                     i: {"n_failures": getattr(b, "n_failures", 0), "E": getattr(b, "E", None)}
@@ -895,6 +1098,12 @@ class _ProcessWorker:
     def submit(self, z: Trajectory, rho: float) -> None:
         self._conn.send(("prox", [z.at_bus[i] for i in self.indices], rho))
 
+    def submit_leverage(self, z: Trajectory, eps: float) -> None:
+        self._conn.send(("leverage", [z.at_bus[i] for i in self.indices], eps))
+
+    def submit_metric(self, metric: LeverageMetric) -> None:
+        self._conn.send(("set_metric", {i: _generator_metric_args(metric, i) for i in self.indices}))
+
     def _receive(self):
         status, payload = self._conn.recv()
         if status == "error":
@@ -903,6 +1112,9 @@ class _ProcessWorker:
 
     def collect(self) -> list[tuple[int, Trajectory]]:
         return list(zip(self.indices, self._receive()))
+
+    def collect_raw(self):
+        return self._receive()
 
     def stats(self) -> dict:
         self._conn.send(("stats",))
@@ -944,6 +1156,20 @@ class BusBehavioursProcesses(Proxable):
             for i, ret_i in worker.collect():
                 ret.at_bus[i] = ret_i
         return ret
+
+    def leverage_directions(self, z: Trajectory, eps: float = 1e-2) -> dict:
+        for worker in self._workers:
+            worker.submit_leverage(z, eps)
+        out = {}
+        for worker in self._workers:
+            out.update(worker.collect_raw())
+        return out
+
+    def set_metric(self, metric: LeverageMetric) -> None:
+        for worker in self._workers:
+            worker.submit_metric(metric)
+        for worker in self._workers:
+            worker.collect_raw()
 
     def stats(self) -> dict:
         merged: dict = {}
