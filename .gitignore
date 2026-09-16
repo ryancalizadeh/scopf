@@ -3,3 +3,4 @@ __pycache__/
 app.log
 results/
 *.pyc
+archive/

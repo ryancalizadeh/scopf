@@ -46,20 +46,11 @@ class Trajectory:
     """
     A dict-like container mapping str -> np.ndarray of shape
     (horizon, width), representing a finite-horizon trajectory of
-    steady-state quantities (voltage, current, frequency, ...).
+    steady-state quantities (angle, power, ...).
 
-    Signal width varies by key: electrical signals (voltage, current, ...)
-    are indexed per-bus (width n_buses), while mechanical signals (rotor
-    angle, frequency, ...) exist only at generator buses (width n_gens).
-    By convention the "omega" key holds the rotor speed deviation from
-    synchronous speed (omega_abs - omega_s, rad/s), not the absolute speed.
-    Generator buses are assumed to be the first n_gens bus indices, so a
-    bus index/slice that stays within range is valid for both. All keys
-    must still share the same time horizon.
-
-    Arrays may be real or complex independently per key (e.g. "v"/"i" as
-    complex phasors, "freq"/"p_mech" as real signals) - dtype is tracked
-    per-key by numpy, nothing extra is needed to support the mix.
+    Signal width varies by key: some signals are indexed per-bus, while 
+    others exist only at specific buses (width = n_XX).
+    All keys must still share the same time horizon.
 
     Three ways to access the underlying data:
       - traj["v"]        -> raw (horizon, width) array for that key
