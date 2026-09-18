@@ -19,15 +19,6 @@ def generate_configs():
         config = Config(n_buses=n_buses, gen_ratio=gen_ratio, load_ratio=load_ratios, avg_degree=avg_degrees, T=1.2, dt=0.1)
         exp1_configs[f"exp1_n_buses_{n_buses}"] = config
 
-    # # Experiment 2:
-    # exp2_configs = {}
-    # n_buses = 15
-    # avg_degrees = [2.0, 2.3, 2.6, 2.9]
-
-    # for avg_degree in avg_degrees:
-    #     config = Config(n_buses=n_buses, gen_ratio=gen_ratio, load_ratio=load_ratios, avg_degree=avg_degree)
-    #     exp2_configs[f"exp2_avg_degree_{avg_degree}"] = config
-
     # Save the configurations to a pickle file
     with open('configs.pkl', 'wb') as f:
         pickle.dump({'exp1': exp1_configs}, f)

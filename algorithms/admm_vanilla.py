@@ -17,7 +17,6 @@ def solve(config: Config, parallel: "bool | str" = False) -> SolveResult:
     """
     n_buses = config.n_buses
     n_gens = config.n_gens
-    N = config.N
 
     f = F(config)
     g = make_bus_behaviours(config, parallel=parallel)
