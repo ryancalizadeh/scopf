@@ -217,3 +217,58 @@ New `test_admm.py`, mirroring `test_centralized.py`'s structure:
 
 Run: `./venv/Scripts/python.exe test_admm.py`, and `python test_centralized.py` to confirm
 the centralized path still passes unchanged.
+
+## Outcome (2026-09-21)
+
+Implemented as above with these deviations, each forced by a measurement:
+
+- **`rho` is fixed at 2.0, not `rho_for_size`.** Under the ramp `s = rho·|dz|` stalls
+  (7.2e-3 at n=5 while `r` reaches 1e-9) because `|dz|` shrinks only as `1/rho`; the run
+  never stops and `rho` grows until CLARABEL fails at ~1e14. A `|dz|` stop rule was
+  considered and rejected: it is not the ADMM dual-feasibility criterion, and the ramp
+  itself has no convergence guarantee. Sweep of fixed `rho ∈ {1, 2, 5, 10, 20}` and residual
+  balancing at n = 5/8/15/45 (table in `common.rho_fixed`): fixed 2 converges everywhere
+  within ~2× of the best fixed value; balancing wins at n=15 but fails at n=45 after a single
+  `rho` halving. `rho_for_size` / `rho_geometric` remain available via `solve(rho=...)`; the
+  docstring table on `rho_for_size` describes the old problem.
+- **Only the objective and generator dispatch are asserted against centralized.** The
+  cost is strictly convex in `p_gen` alone, so the battery split (and with it `theta`,
+  `soc`, thermal timing) is non-unique: at n=5 the two batteries differ from centralized
+  by 0.06 each while their sum agrees to 3e-3. Those distances are printed, not asserted.
+- **Prox QPs solve at CLARABEL tolerance 1e-10** (`common._QP_TOL`). A projection's
+  variable error scales as √(objective gap), so the default 1e-8 left the device
+  projections accurate to only ~1e-4 and the line-limit QP non-idempotent at 6e-5.
+- **`test_centralized.check_solution` gained `imbalance_tol`** (default unchanged) so it can
+  gate the ADMM `z`, whose power balance holds to the primal residual, not 1e-6.
+
+Results, fixed `rho = 2`, threshold `1e-3·sqrt(n/8)`: n=5 197 its / 1.9 s / gap 7.5e-9;
+n=8 820 its / 11.7 s / gap 1.6e-5; n=45 781 its / 70 s / gap 2.2e-6 with line utilization
+1.000. Thread and process executors reproduce the sequential run bit-for-bit.
+
+### rho-schedule follow-up at n = 45 and 75 (2026-09-21, 22 runs, 2000-iteration budget)
+
+Question: can tuned residual balancing, a larger fixed `rho`, or a capped ramp beat fixed 2
+on the larger networks, and why does balancing fail at n=45 when it worked below?
+
+- **Balancing fails at n=45 for config-specific reasons, not size.** (i) `rho = 2` is already
+  the best fixed value there (1: 1168, 2: 781, 3: 873, 5: 819, 10: 1528, ≥20: none), and
+  `s/r` averages 1–2 in that run. (ii) The residuals oscillate with a ~40-iteration period
+  whose `s/r` swing exceeds `mu = 10` at the troughs, so every trigger is a false positive;
+  each halving (with the `u` rescale) kicks `r` up 5×, and the rule locks onto the
+  oscillation (changes come in pairs 20 iterations apart). `tau = 1.5` is worse (45
+  changes); `mu ≥ 50`, the rule every 50 iterations, or the rule on 40-iteration running
+  means never trigger and reduce to fixed 2. (iii) The oscillation comes from the single
+  binding line (26, 34), thermal bus ↔ battery bus: their power split is a flat direction of
+  the cost and the limit cuts across it. With the limits relaxed 1.5× the same config
+  converges in 265 iterations. At n=75 (two binding lines, none on a flat direction)
+  balancing converges in 149 vs 172 fixed with one early change to `rho = 1`, as at n=5/15.
+- **Larger fixed `rho` is monotonically worse at both sizes**, iterations ~linear in `rho`
+  (n=75: 2→172, 5→476, 10→941). `r` converges fast, `s = rho·|dz|` does not; at `rho = 50`
+  the dispatch is 0.18 off after 2000 iterations while the objective gap reads 8e-6.
+- **Capped ramps (growth 1.02/1.05) freeze the iterate**: caps 20 and 100 fail at n=45
+  (small `r`, `s` 0.01–0.25, dispatch 0.01–0.19 off); cap 10 converges in 1021 (1.3×
+  fixed 2); cap 20 converges at n=75 in 1605 (9× fixed 2).
+
+Conclusion: fixed `rho = 2` stays the default. The n=45 cost is structural; the untried
+levers are over-relaxation (`alpha ≈ 1.5–1.8`) or a small quadratic on battery/thermal power
+to remove the flat direction (which changes the problem).

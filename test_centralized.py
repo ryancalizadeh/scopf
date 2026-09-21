@@ -41,8 +41,12 @@ def bus_types(config: Config) -> list[str]:
             + ["thermal"] * config.n_thermal + ["battery"] * config.n_battery)
 
 
-def check_solution(config: Config, traj) -> None:
-    """Asserts the trajectory satisfies the constraints; raises AssertionError if not."""
+def check_solution(config: Config, traj, imbalance_tol: float = 1e-6) -> None:
+    """
+    Asserts the trajectory satisfies the constraints; raises AssertionError if not.
+    imbalance_tol loosens only the power-balance check, for ADMM iterates whose
+    network coupling holds to the primal residual rather than to solver precision.
+    """
     tol = 1e-6
     N, dt = config.N, config.dt
     n_gens, n_loads = config.n_gens, config.n_loads
@@ -55,7 +59,7 @@ def check_solution(config: Config, traj) -> None:
 
     # Lossless DC flow: injections sum to zero at every step.
     imbalance = np.abs(p.sum(axis=1)).max()
-    assert imbalance < 1e-6, f"power imbalance {imbalance:.2e}"
+    assert imbalance < imbalance_tol, f"power imbalance {imbalance:.2e}"
 
     # Generators: capacity and ramping.
     p_gen = p[:, :n_gens]

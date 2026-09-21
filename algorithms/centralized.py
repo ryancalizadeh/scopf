@@ -1,4 +1,5 @@
 import time
+from typing import Dict
 import numpy as np
 import cvxpy as cp
 from Config import Config
@@ -6,47 +7,12 @@ from Trajectory import Trajectory
 from algorithms.base import SolveResult
 
 
-def solve(config: Config) -> SolveResult:
+def _build_constraints(config: Config) -> "tuple[list, Dict[str, cp.Variable]]":
     """
-    Centralized dynamic DC optimal power flow over a T-hour horizon.
-
-    Solves one convex QP over all N = T/dt steps jointly (not a sequence of
-    single-period OPFs): the storage and thermal states couple the steps, so the
-    dispatch at t depends on the whole horizon.
-
-    Index layout: buses are ordered [generators | loads | thermal | batteries],
-    G = {0..n_g-1}, L, H and S the following blocks, V = G u L u H u S.
-
-        min_{p, theta, q, T}  sum_{t=0}^{N-1} sum_{i in G} alpha_i p_{i,t}^2 + beta_i p_{i,t}
-
-        s.t.  P_t = B theta_t,                               t = 0..N-1     (DC power flow)
-              theta_{0,t} = 0                                               (angle reference)
-              |B_ij (theta_{i,t} - theta_{j,t})| <= F_ij,     (i,j) in E     (line limits)
-
-              P_{i,t} = p_{i,t}            i in G                           (generation)
-              P_{i,t} = -P^load_{i,t}      i in L                           (fixed demand)
-              P_{i,t} = -p_{i,t}           i in H                           (thermal draw)
-              P_{i,t} = p_{i,t}            i in S                           (battery, discharge > 0)
-
-              P^min_i <= p_{i,t} <= P^max_i                   i in G        (capacity)
-              R^min_i <= p_{i,t+1} - p_{i,t} <= R^max_i       i in G        (ramping)
-
-              q_{i,t+1} = q_{i,t} - dt p_{i,t}                i in S        (SOC dynamics)
-              q^min_i <= q_{i,t} <= q^max_i,  q_{i,0} = q0_i,  q_{i,N} = qT_i
-              p^min_i <= p_{i,t} <= p^max_i                   i in S
-
-              T_{i,t+1} = (1 - mu_i/c_i) T_{i,t} + (eta_i/c_i) p_{i,t}
-                                          + (mu_i/c_i) Tamb_{i,t}   i in H  (thermal dynamics)
-              T^min_{i,t} <= T_{i,t} <= T^max_{i,t},  T_{i,0} = T0_i         (comfort band)
-              p^min_i <= p_{i,t} <= p^max_i                   i in H
-
-    Sign conventions: P is net injection, so load-like devices are negative. For
-    thermal units p > 0 heats, and the unit draws that power from its bus.
-
-    The objective is convex quadratic and every constraint is affine, so this is a
-    QP solved with CLARABEL via cvxpy; the returned point is a global optimum.
-    Convergence and residual fields of SolveResult are None, as they apply only to
-    the ADMM solvers.
+    Variables and constraints of the dynamic DC-OPF (see solve() for the full
+    formulation). Shared by solve() and check_feasible() so the two can never
+    drift apart: a config is feasible iff this constraint set is non-empty,
+    which is exactly what solve() requires to succeed.
     """
     N = config.N
     dt = config.dt
@@ -127,6 +93,74 @@ def solve(config: Config) -> SolveResult:
     for i, j in config.lines:
         flow = -config.B[i, j] * (theta[i, :] - theta[j, :])
         constraints.append(cp.abs(flow) <= config.line_flow_limits[i, j])
+
+    variables = {
+        "theta": theta, "P": P, "p_gen": p_gen,
+        "p_thermal": p_thermal, "p_batt": p_batt, "temp": temp, "soc": soc,
+    }
+    return constraints, variables
+
+
+def check_feasible(config: Config) -> bool:
+    """
+    True iff config's DC-OPF constraint set is non-empty: line limits,
+    generator/thermal/battery boxes and dynamics, ramping, and SOC/comfort
+    bounds are all jointly satisfiable. Solves the exact same constraints as
+    solve() against a zero objective, so this is precise (not a heuristic
+    approximation) and a feasible config is exactly one solve() will not
+    raise on.
+    """
+    constraints, _ = _build_constraints(config)
+    problem = cp.Problem(cp.Minimize(0), constraints)
+    problem.solve(solver=cp.CLARABEL)
+    return problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+
+
+def solve(config: Config) -> SolveResult:
+    """
+    Centralized dynamic DC optimal power flow over a T-hour horizon.
+
+    Solves one convex QP over all N = T/dt steps jointly (not a sequence of
+    single-period OPFs): the storage and thermal states couple the steps, so the
+    dispatch at t depends on the whole horizon.
+
+    Index layout: buses are ordered [generators | loads | thermal | batteries],
+    G = {0..n_g-1}, L, H and S the following blocks, V = G u L u H u S.
+
+        min_{p, theta, q, T}  sum_{t=0}^{N-1} sum_{i in G} alpha_i p_{i,t}^2 + beta_i p_{i,t}
+
+        s.t.  P_t = B theta_t,                               t = 0..N-1     (DC power flow)
+              theta_{0,t} = 0                                               (angle reference)
+              |B_ij (theta_{i,t} - theta_{j,t})| <= F_ij,     (i,j) in E     (line limits)
+
+              P_{i,t} = p_{i,t}            i in G                           (generation)
+              P_{i,t} = -P^load_{i,t}      i in L                           (fixed demand)
+              P_{i,t} = -p_{i,t}           i in H                           (thermal draw)
+              P_{i,t} = p_{i,t}            i in S                           (battery, discharge > 0)
+
+              P^min_i <= p_{i,t} <= P^max_i                   i in G        (capacity)
+              R^min_i <= p_{i,t+1} - p_{i,t} <= R^max_i       i in G        (ramping)
+
+              q_{i,t+1} = q_{i,t} - dt p_{i,t}                i in S        (SOC dynamics)
+              q^min_i <= q_{i,t} <= q^max_i,  q_{i,0} = q0_i,  q_{i,N} = qT_i
+              p^min_i <= p_{i,t} <= p^max_i                   i in S
+
+              T_{i,t+1} = (1 - mu_i/c_i) T_{i,t} + (eta_i/c_i) p_{i,t}
+                                          + (mu_i/c_i) Tamb_{i,t}   i in H  (thermal dynamics)
+              T^min_{i,t} <= T_{i,t} <= T^max_{i,t},  T_{i,0} = T0_i         (comfort band)
+              p^min_i <= p_{i,t} <= p^max_i                   i in H
+
+    Sign conventions: P is net injection, so load-like devices are negative. For
+    thermal units p > 0 heats, and the unit draws that power from its bus.
+
+    The objective is convex quadratic and every constraint is affine, so this is a
+    QP solved with CLARABEL via cvxpy; the returned point is a global optimum.
+    Convergence and residual fields of SolveResult are None, as they apply only to
+    the ADMM solvers.
+    """
+    constraints, v = _build_constraints(config)
+    theta, P, p_gen = v["theta"], v["P"], v["p_gen"]
+    temp, soc = v["temp"], v["soc"]
 
     cost = cp.sum(cp.multiply(config.gen_cost_alpha[:, None], cp.square(p_gen))
                   + cp.multiply(config.gen_cost_beta[:, None], p_gen))

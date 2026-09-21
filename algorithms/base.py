@@ -19,4 +19,5 @@ class SolveResult:
     p_residual: Optional[float]
     s_residual: Optional[float]
     convergence: Optional[ConvergenceHistory]
-    
+    # Per-constraint violations of the returned trajectory (common.check_solution).
+    checks: Optional[dict] = None

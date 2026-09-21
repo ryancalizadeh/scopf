@@ -10,6 +10,7 @@ class Config:
     - T: Horizon length in hours (default 24, midnight-to-midnight).
     - dt: Time step size in hours (default 0.25, i.e., 15 minutes).
     - N: Number of time steps, equal to int(T / dt).
+    - seed: Random seed used to generate the network and device data.
     - n_buses: Total number of buses in the network.
     - n_gens: Number of generator buses.
     - n_loads: Number of load buses.
@@ -85,9 +86,11 @@ class Config:
                  thermal_ratio: float = 0.25,
                  battery_ratio: float = 0.25,
                  T: float = 24,
-                 dt: float = 0.25
+                 dt: float = 0.25,
+                 seed: int = 42
                 ):
-        rng = np.random.default_rng(seed=42)  # For reproducibility
+        self.seed = seed
+        rng = np.random.default_rng(seed=self.seed)
         self.T = T
         self.dt = dt
         self.N = int(T / dt)
@@ -229,11 +232,41 @@ class Config:
 
 
     def make_base_trajectory(self) -> Trajectory:
-        raise NotImplementedError("make_base_trajectory is not implemented yet.")
+        """
+        Starting point for the distributed solvers. Every key has width n_buses
+        so that Trajectory.at_bus[i] hands each device its own column:
+
+            p      bus net injection (sign as in algorithms/centralized.py)
+            theta  bus voltage angle
+            soc    battery SOC, zero on non-battery columns
+            temp   thermal state minus thermal_T0, zero on non-thermal columns
+
+        Loads sit at their exact demand, generators split the total fixed load
+        evenly (clipped to their capacity), flexible devices draw nothing, and
+        the states start inside their feasible sets (soc at q0, temp at T0).
+        """
+        N, n = self.N, self.n_buses
+        n_gens, n_loads, n_thermal = self.n_gens, self.n_loads, self.n_thermal
+
+        p = np.zeros((N, n))
+        p[:, n_gens:n_gens + n_loads] = -self.load_P.T
+        if n_gens:
+            share = self.load_P.sum(axis=0) / n_gens                     # (N,)
+            p[:, :n_gens] = np.clip(share[:, None], self.gen_P_min, self.gen_P_max)
+
+        soc = np.zeros((N, n))
+        soc[:, n_gens + n_loads + n_thermal:] = self.battery_q0
+
+        return Trajectory({
+            "p": p,
+            "theta": np.zeros((N, n)),
+            "soc": soc,
+            "temp": np.zeros((N, n)),
+        })
 
     def generate_Y_bus(self, avg_degree: float):
         # TODO For now this is fine. In the future, I should follow the methodology of Birchfield 2017
-        rng = np.random.default_rng(seed=42)  # For reproducibility
+        rng = np.random.default_rng(seed=self.seed)
         n = self.n_buses
         edges = set()
 
