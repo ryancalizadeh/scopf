@@ -5,7 +5,7 @@ from Config import Config
 from Trajectory import Trajectory
 from admm import admm
 from algorithms.base import SolveResult, ConvergenceHistory
-from algorithms.common import F, make_bus_behaviours, rho_for_size, check_solution
+from algorithms.common import make_bus_behaviours, rho_for_size, check_solution, Network
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +16,11 @@ def solve(config: Config, parallel: "bool | str" = False) -> SolveResult:
     False / "sequential", True / "threads", or "processes".
     """
     n_buses = config.n_buses
-    n_gens = config.n_gens
 
+    # @claude put the network behaviour in here
     f = F(config)
     g = make_bus_behaviours(config, parallel=parallel)
 
-    # TODO: Match this to vars in use
     z0 = config.make_base_trajectory()
 
     start = time.perf_counter()
@@ -46,6 +45,6 @@ def solve(config: Config, parallel: "bool | str" = False) -> SolveResult:
         obj=checks["objective"],
         runtime=runtime,
         p_residual=checks["network_residual"],
-        s_residual=checks["power_balance_residual"],
+        s_residual=checks["power_balance_residual"], # TODO This line and the above might need to change. Might just pass the whole checks object with all constraint residuals
         convergence=ConvergenceHistory(r=rs, s=ss, rho=rhos),
     )

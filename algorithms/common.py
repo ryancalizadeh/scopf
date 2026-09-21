@@ -33,50 +33,89 @@ def _solve_or_last_iterate(opti: ca.Opti):
     except RuntimeError:
         return opti.debug.value, False
 
-class ConstPowerLoad(Proxable):
-    # TODO Update this with the new problem
-
-    def __init__(self, config: Config, bus_index: int, load_index: int, max_iter=100, tol=1e-8):
-        raise NotImplementedError("ConstPowerLoad.prox is not implemented yet")
+class Network(Proxable):
+    """
+    f(x) = 
+        ind_{P_t = B theta_t, t = 0..N-1}(x) +
+        ind_{|B_ij (theta_{i,t} - theta_{j,t})| <= F_ij,     (i,j) in E}(x)
+    f(x) is the indicator function for the intersection of an affine set with a polyhedron, which reduces to a projection.
+    Should be able to precompute a projector
+    """
+    def __init__(self, config: Config):
+        raise NotImplementedError()
 
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        raise NotImplementedError("ConstPowerLoad.prox is not implemented yet.")
+        raise NotImplementedError()
 
 class Generator(Proxable):
-    # TODO Update this with the new problem
     """
-    A class implementing the prox operator on the indicator function of the behaviour set of a generator (i.e. projection onto the behaviour set).
+    for generator with key i
+    f(x) = 
+        sum_{t in T}(c_i(P_i(t))) +
+        ind_{P^min_i <= p_{i,t} <= P^max_i}(x) +
+        ind_{R^min_i <= p_{i,t+1} - p_{i,t} <= R^max_i}(x)
+    Per bus generator dynamics, constraints, and cost.
+    QP
     """
 
     def __init__(self, config: Config, bus_index: int, gen_index: int, max_iter=500, tol=1e-8):
-        raise NotImplementedError("Generator.prox is not implemented yet")
+        raise NotImplementedError()
 
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        raise NotImplementedError("Generator.prox is not implemented yet. It should project onto the behaviour set of a generator.")
+        raise NotImplementedError()
 
+class Load(Proxable):
+    """
+    for load with key i (positive p is power draw)
+    f(x) = ind_{P_{i,t} = -P^load_{i,t}}(x)
+    Barely even a projection. Just set the power values to the value in P^load.
+    """
 
-class EmptyBus(Proxable):
-    # TODO Update this with the new problem
-
-    def __init__(self, config: Config, bus_index: int):
-        raise NotImplementedError("EmptyBus.prox is not implemented yet")
-
-    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        raise NotImplementedError("EmptyBus.prox is not implemented yet. It should project onto the behaviour set of an empty bus.")
-
-class F(Proxable):
-    # TODO Update this with the new problem
-
-    def __init__(self, config: Config, solver: str = "CLARABEL"):
-        raise NotImplementedError("F.prox is not implemented yet")
+    def __init__(self, config: Config, bus_index: int, load_index: int):
+        raise NotImplementedError()
 
     def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
-        raise NotImplementedError("F.prox is not implemented yet. ")
+        raise NotImplementedError()
 
+class Battery(Proxable):
+    """
+    for battery with key i
+    f(x) =
+        ind_{q_{i,t+1} = q_{i,t} - dt p_{i,t}}(x) +
+        ind_{q^min_i <= q_{i,t} <= q^max_i}(x) +
+        ind_{q_{i,0} = q0_i}(x) +
+        ind_{q_{i,N} = qT_i}(x) +
+        ind_{p^min_i <= p_{i,t} <= p^max_i}(x)
+    Projects onto the intersection of SOC dynamics (affine) and box constraints on state q and input p
+    Should be able to precompute
+    """
+
+    def __init__(self, config: Config, bus_index: int, battery_index: int):
+        raise NotImplementedError()
+    
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        raise NotImplementedError()
+
+class Thermal(Proxable):
+    """
+    for thermal with key i (positive p is power draw)
+    f(x) =
+        ind_{T_{i,t+1} = (1 - mu_i/c_i) T_{i,t} + (eta_i/c_i) p_{i,t} + (mu_i/c_i) Tamb_{i,t}}(x) +
+        ind_{T^min_{i,t} <= T_{i,t} <= T^max_{i,t}}(x) +
+        ind_{T_{i,0} = T0_i}(x) +
+        ind_{p^min_i <= p_{i,t} <= p^max_i}(x)
+
+    """
+
+    def __init__(self, config: Config, bus_index: int, thermal_index: int):
+        raise NotImplementedError()
+    
+    def prox(self, z: Trajectory, rho: float = 1.0) -> Trajectory:
+        raise NotImplementedError()
 
 class BusBehaviours(Proxable):
     """
-    A class implementing projections onto the behaviours of a set of buses, each with its own behaviour (e.g., constant power load, generator, etc.)
+    A class implementing projections onto the behaviours of a set of buses, each with its own behaviour (e.g., generator, load, etc.)
     """
     def __init__(self, behaviours: list[Proxable]):
         self.behaviours = behaviours
