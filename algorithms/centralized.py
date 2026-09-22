@@ -5,6 +5,9 @@ import cvxpy as cp
 from Config import Config
 from Trajectory import Trajectory
 from algorithms.base import SolveResult
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _build_constraints(config: Config) -> "tuple[list, Dict[str, cp.Variable]]":
@@ -189,6 +192,8 @@ def solve(config: Config) -> SolveResult:
         "soc": np.asarray(soc.value)[:, 1:].T,
         "temp": np.asarray(temp.value)[:, 1:].T,
     })
+
+    logger.info(f"Centralized finished with objective={problem.value}")
 
     return SolveResult(
         trajectory=trajectory,

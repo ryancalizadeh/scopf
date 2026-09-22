@@ -48,7 +48,7 @@ def _run_sweep(configs: dict, results_dir: str, run_timestamp: str, sweep_name: 
 
 def run_experiments():
     # Experiment 1: n_buses vs runtime
-    n_buses_list = [5, 15, 30, 75, 135]
+    n_buses_list = [8, 32, 100, 300]
     avg_degree = 2.3
     n_runs = 5
 

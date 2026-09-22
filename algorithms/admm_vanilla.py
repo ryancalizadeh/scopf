@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def solve(config: Config, parallel: "bool | str" = False, *,
-          rho: Optional[Callable] = None, max_iterations: int = 10000) -> SolveResult:
+          rho: Optional[Callable] = None, max_iterations: int = 1000) -> SolveResult:
     """
     Dynamic DC-OPF of centralized.py by ADMM, split as
         f = Network        (DC power flow + line limits, one projection per iteration)

@@ -258,9 +258,8 @@ on the larger networks, and why does balancing fail at n=45 when it worked below
   oscillation (changes come in pairs 20 iterations apart). `tau = 1.5` is worse (45
   changes); `mu ≥ 50`, the rule every 50 iterations, or the rule on 40-iteration running
   means never trigger and reduce to fixed 2. (iii) The oscillation comes from the single
-  binding line (26, 34), thermal bus ↔ battery bus: their power split is a flat direction of
-  the cost and the limit cuts across it. With the limits relaxed 1.5× the same config
-  converges in 265 iterations. At n=75 (two binding lines, none on a flat direction)
+  binding line (26, 34); see the mechanism below. With the limits relaxed 1.5× the same
+  config converges 3× faster. At n=75 (two binding lines, not bridges into a rigid pocket)
   balancing converges in 149 vs 172 fixed with one early change to `rho = 1`, as at n=5/15.
 - **Larger fixed `rho` is monotonically worse at both sizes**, iterations ~linear in `rho`
   (n=75: 2→172, 5→476, 10→941). `r` converges fast, `s = rho·|dz|` does not; at `rho = 50`
@@ -269,6 +268,32 @@ on the larger networks, and why does balancing fail at n=45 when it worked below
   (small `r`, `s` 0.01–0.25, dispatch 0.01–0.19 off); cap 10 converges in 1021 (1.3×
   fixed 2); cap 20 converges at n=75 in 1605 (9× fixed 2).
 
-Conclusion: fixed `rho = 2` stays the default. The n=45 cost is structural; the untried
-levers are over-relaxation (`alpha ≈ 1.5–1.8`) or a small quadratic on battery/thermal power
-to remove the flat direction (which changes the problem).
+Conclusion: fixed `rho = 2` stays the default. The n=45 cost is structural (below).
+
+### Mechanism of the n=45 slow mode (2026-09-21, current cost coefficients)
+
+Line (26,34) is a **bridge**; behind it is a radial pocket {17, 20, 24, 26, 31} holding two
+fixed loads and three thermal units, no generation or storage. During the 6:30–8:00 pre-heat
+(t = 26–32) the pocket's demand at full heating exceeds the line's 4.445, so the optimum
+rations the three heaters: pocket net demand equals the limit at all seven steps, the heat is
+shared over time (26 at 1.0 for six steps, 24 ramping 0.44→1.0, 31 ramping 1.0→0.39), and the
+line multiplier is large (mean 3.7, max 7.0 vs β ≈ 6). That ration is an implicit coupling
+constraint among three devices that live in separate `g` blocks; only the dual (bus prices)
+can enforce it, so ADMM runs a price-adjustment loop on the pocket. The devices' price
+response is degenerate — zero at a box bound (bus 26 sits at `p_max` six of seven steps),
+bang-bang off it and lagged through the decay-0.9 dynamics — so clearing needs large price
+moves for small quantity moves: an ill-conditioned fixed point with lag, i.e. a slowly damped
+oscillation (`cos θ_F` near 1 in Douglas–Rachford terms).
+
+Evidence: every primal quantity on the line converges by iteration ~120 (flow = F, `p26_z =
+−1.0000`, `p34 = 0.0414`, active set 7 steps every iteration, no chattering) while the pocket
+price `u26` is still oscillating around 3.63 at iteration 890; `u34` across the bridge settles
+at 3.2966 by iteration 126. Asymptotic rate: base a decade per 751 iterations (892 to
+converge); limits relaxed 1.5× a decade per 91 (253); the same config with `ε·Σ(p_th² +
+p_batt²)` added to both solvers, which removes every flat direction of the cost (optimal face
+dimension ≥ 11 → 0), a decade per 489 (787) — so the earlier "flat direction cut by the
+limit" hypothesis is wrong; a quadratic on `p` adds no elasticity at an active bound.
+
+Levers that follow: re-partition the split at the bridge (pocket + bridge constraint as one
+`g` block, the multi-area-OPF remedy); a larger per-block `rho` on pocket buses; over-relaxation
+(damping only, constant factor).

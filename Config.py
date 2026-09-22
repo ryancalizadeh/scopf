@@ -127,8 +127,8 @@ class Config:
         self.gen_R_min = -0.3 * self.gen_P_max
         self.gen_R_max =  0.3 * self.gen_P_max
 
-        self.gen_cost_alpha = rng.uniform(0.05, 0.2, self.n_gens)
-        self.gen_cost_beta = rng.uniform(10.0, 15.0, self.n_gens)
+        self.gen_cost_alpha = rng.uniform(0.01, 0.08, self.n_gens)
+        self.gen_cost_beta = rng.uniform(5.0, 7.0, self.n_gens)
 
         # Loads:
         # Typical daily demand shape: overnight minimum, morning ramp, and

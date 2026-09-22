@@ -26,6 +26,7 @@ def experiment_runner(configs: List[Config], plot_convergence_flag: bool = False
     """
     feasible_configs = []
     for config in configs:
+        logger.info(f"Checking config (seed={config.seed}, n_buses={config.n_buses})")
         if check_feasible(config):
             feasible_configs.append(config)
         else:

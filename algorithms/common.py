@@ -519,9 +519,16 @@ def rho_fixed(value: float = 2.0):
     every trigger is a false positive, each halving kicks r up 5x, and the
     rule locks onto the oscillation. mu >= 50, or the rule on smoothed
     residuals, never triggers there and reduces to fixed 2; tau = 1.5 is
-    worse. The oscillation itself comes from the one binding line, which
-    joins a thermal bus to a battery bus and cuts across a flat direction of
-    the cost; with the limits relaxed the same config converges in 265.
+    worse. The oscillation itself comes from the one binding line (26,34),
+    a bridge behind which sit two loads and three thermal units and nothing
+    else: during the 6:30-8:00 pre-heat their aggregate draw is rationed to
+    the line limit, a coupling among three g-blocks that only the dual
+    (bus prices) can enforce, and the thermals' price response is zero at
+    their box bound and bang-bang off it. The slow mode is the pocket price
+    (u at bus 26) while every primal quantity converges early; with the
+    limits relaxed the same config converges 3x faster (253 vs 892 its),
+    while removing the cost's flat directions with a small quadratic on
+    flexible power does not help (787 its).
 
     Geometric ramps (rho_geometric, rho_for_size) capped at 20-100 freeze the
     iterate before the dual converges (small r, large s, dispatch 0.1-0.2 off)
