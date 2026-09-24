@@ -524,11 +524,14 @@ def rho_fixed(value: float = 2.0):
     else: during the 6:30-8:00 pre-heat their aggregate draw is rationed to
     the line limit, a coupling among three g-blocks that only the dual
     (bus prices) can enforce, and the thermals' price response is zero at
-    their box bound and bang-bang off it. The slow mode is the pocket price
-    (u at bus 26) while every primal quantity converges early; with the
-    limits relaxed the same config converges 3x faster (253 vs 892 its),
-    while removing the cost's flat directions with a small quadratic on
-    flexible power does not help (787 its).
+    their box bound and bang-bang off it: shifting the price offered to the
+    three heaters by +-0.4 moves their aggregate congested-window heat by
+    ~0.005 (pass-through ~0.03). The slow mode is the pocket price (u at bus
+    26) while every primal quantity converges early (flow = F by it 56,
+    active set steady from it 88); with the limits relaxed the same config
+    converges 3.5x faster (253 vs 892 its), while removing the cost's flat
+    directions with a small quadratic on flexible power does not help at all
+    (892 its, same rate, different iterate path). Re-verified 2026-09-22.
 
     Geometric ramps (rho_geometric, rho_for_size) capped at 20-100 freeze the
     iterate before the dual converges (small r, large s, dispatch 0.1-0.2 off)
