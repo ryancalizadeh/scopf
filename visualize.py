@@ -51,19 +51,5 @@ def plot_convergence(history: ConvergenceHistory, title: str = "ADMM convergence
     ax.set_title(title)
     ax.legend()
     fig.savefig(f"results/{title.replace(' ', '_')}.png")
-    # return fig
+    return fig
 
-
-def print_dispatch_comparison(aggregated: Dict[str, AggregatedResult], reference: str = "centralized"):
-    if reference not in aggregated:
-        logger.info(f"No '{reference}' result available for comparison.")
-        return
-
-    ref = aggregated[reference]
-    logger.info(f"Dispatch/objective deviation vs '{reference}':")
-    for name, agg in aggregated.items():
-        if name == reference:
-            continue
-        dispatch_diff = float(np.linalg.norm(agg.dispatch_ref - ref.dispatch_ref))
-        obj_diff = abs(agg.obj_mean - ref.obj_mean)
-        logger.info(f"  {name}: ||dispatch_diff||={dispatch_diff:.6g}, |obj_diff|={obj_diff:.6g}")

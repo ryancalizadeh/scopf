@@ -13,13 +13,11 @@ class ConvergenceHistory:
 
 @dataclass
 class SolveResult:
-    dispatch: np.ndarray
+    trajectory: Trajectory
     obj: float
     runtime: float
     p_residual: Optional[float]
     s_residual: Optional[float]
-    convergence: Optional[ConvergenceHistory] = None
-    # Full solved time-domain trajectory (keys "v", "i", "s", "delta", "omega",
-    # "E"), when the algorithm provides one. "omega" is the rotor speed
-    # deviation from synchronous speed (rad/s).
-    trajectory: Optional[Trajectory] = None
+    convergence: Optional[ConvergenceHistory]
+    # Per-constraint violations of the returned trajectory (common.check_solution).
+    checks: Optional[dict] = None

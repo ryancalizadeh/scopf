@@ -1,9 +1,11 @@
 import os
 import pickle
 from datetime import datetime
+from typing import List
+from Config import Config
 from experiment_runner import experiment_runner
 from ExperimentResult import aggregate
-from visualize import plot_runtime_scaling, print_dispatch_comparison
+from visualize import plot_runtime_scaling
 import logging
 import sys
 
@@ -21,13 +23,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _make_configs(n_runs: int, **config_kwargs) -> List[Config]:
+    """Same experiment parameters, one distinct random seed per run."""
+    return [Config(seed=seed, **config_kwargs) for seed in range(n_runs)]
+
+
 def _run_sweep(configs: dict, results_dir: str, run_timestamp: str, sweep_name: str):
     raw_results = {}
     aggregated_results = {}
 
-    for key, config in configs.items():
+    for key, run_configs in configs.items():
         logger.info(f"Running experiment for {key}")
-        results = experiment_runner(config, n_runs=1, plot_convergence_flag=True)
+        results = experiment_runner(run_configs, plot_convergence_flag=True)
         raw_results[key] = results
         aggregated_results[key] = {name: aggregate(runs) for name, runs in results.items()}
 
@@ -36,18 +43,19 @@ def _run_sweep(configs: dict, results_dir: str, run_timestamp: str, sweep_name: 
         with open(os.path.join(results_dir, f"{sweep_name}_aggregated_{run_timestamp}.pkl"), 'wb') as f:
             pickle.dump(aggregated_results, f)
 
-    for key, aggregated in aggregated_results.items():
-        logger.info(f"\n{key}:")
-        print_dispatch_comparison(aggregated)
-
     return raw_results, aggregated_results
 
 
 def run_experiments():
-    with open('configs.pkl', 'rb') as f:
-        configs = pickle.load(f)
-    configs_exp1 = configs['exp1']
-    # configs_exp2 = configs['exp2']
+    # Experiment 1: n_buses vs runtime
+    n_buses_list = [8, 32, 100, 300]
+    avg_degree = 2.3
+    n_runs = 5
+
+    configs_exp1 = {
+        f"exp1_n_buses_{n_buses}": _make_configs(n_runs, n_buses=n_buses, avg_degree=avg_degree)
+        for n_buses in n_buses_list
+    }
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -55,21 +63,13 @@ def run_experiments():
     logger.info("=== exp1: n_buses vs runtime ===")
     _, exp1_aggregated = _run_sweep(configs_exp1, RESULTS_DIR, run_timestamp, "exp1")
 
-    # logger.info("\n=== exp2: avg_degree vs runtime ===")
-    # _, exp2_aggregated = _run_sweep(configs_exp2, RESULTS_DIR, run_timestamp, "exp2")
-
-    exp1_by_n_buses = {config.n_buses: agg for config, agg in
-                        zip(configs_exp1.values(), exp1_aggregated.values())}
-    # exp2_by_avg_degree = {}
-    # for key, agg in exp2_aggregated.items():
-    #     avg_degree = float(key.split("_")[-1])
-    #     exp2_by_avg_degree[avg_degree] = agg
+    exp1_by_n_buses = {
+        float(n_buses): aggregated
+        for n_buses, aggregated in zip(n_buses_list, exp1_aggregated.values())
+    }
 
     fig1 = plot_runtime_scaling(exp1_by_n_buses, xlabel="n_buses", title="exp1: n_buses vs runtime")
     fig1.savefig(os.path.join(RESULTS_DIR, f"exp1_runtime_{run_timestamp}.png"))
-
-    # fig2 = plot_runtime_scaling(exp2_by_avg_degree, xlabel="avg_degree", title="exp2: avg_degree vs runtime")
-    # fig2.savefig(os.path.join(RESULTS_DIR, f"exp2_runtime_{run_timestamp}.png"))
 
 
 if __name__ == "__main__":

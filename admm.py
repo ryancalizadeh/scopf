@@ -28,20 +28,14 @@ def admm(f: Proxable,
 
     # Initialize x0, z0, mu0
     zs: list[Trajectory] = [z0.copy()]
-    xs: list[Trajectory] = [z0.zeroslike()]
+    xs: list[Trajectory] = [z0.copy()]
     us: list[Trajectory] = [z0.zeroslike()]
 
-    rs = [(xs[-1] - zs[-1]).norm()]
-    ss = [(zs[-1] - zs[-1]).norm()]  # Initialize ss with zero since there's no previous z
+    rs = []
+    ss = []
     rhos = [2.0]
 
     for iteration in range(max_iterations-1):
-        new_rho = rho(iteration, rhos[-1], rs[-1], ss[-1])
-        rhos.append(new_rho)
-        # Rescale u when rho changes to keep λ = rho*u continuous
-        if new_rho != rhos[-2]:
-            us[-1] = us[-1] * (rhos[-2] / new_rho)
-
         xs.append(f.prox(zs[-1] - us[-1], rhos[-1]))
         zs.append(g.prox(xs[-1] + us[-1], rhos[-1]))
         us.append(us[-1] + (xs[-1] - zs[-1]))
@@ -49,18 +43,19 @@ def admm(f: Proxable,
         rs.append((xs[-1] - zs[-1]).norm())
         ss.append(rhos[-1] * (zs[-1] - zs[-2]).norm())
 
-        dz = ss[-1] / rhos[-1]  # unscaled dual step ||z_k - z_{k-1}||
+        new_rho = rho(iteration, rhos[-1], rs[-1], ss[-1])
+        rhos.append(new_rho)
+        # Rescale u when rho changes to keep λ = rho*u continuous
+        if new_rho != rhos[-2]:
+            us[-1] = us[-1] * (rhos[-2] / new_rho)
 
         if iteration % 10 == 0:
-            logger.debug(f"ADMM iteration {iteration} / {max_iterations-1}: r={rs[-1]:.6g}, s={ss[-1]:.6g}, |dz|={dz:.6g}, rho={rhos[-1]:.6g}")
+            logger.debug(f"ADMM iteration {iteration} / {max_iterations-1}: r={rs[-1]:.6g}, s={ss[-1]:.6g}, rho={rhos[-1]:.6g}")
 
         if callback is not None:
             callback(iteration, xs[-1], zs[-1], us[-1], rs[-1], ss[-1])
 
-        # Stop on the primal residual and the unscaled dual step: with an
-        # uncapped rho ramp (rho reaches 1e5+) the scaled dual residual
-        # s = rho*|dz| can never fall below the threshold.
-        if rs[-1] < threshold and dz < threshold:
+        if rs[-1] < threshold and ss[-1] < threshold:
             break
 
     return xs, zs, us, rs, ss, rhos

@@ -5,7 +5,7 @@ from algorithms.admm_vanilla import solve as _solve_vanilla
 
 # Below this many buses the pinned-thread executor is faster (the per-iteration
 # process messaging outweighs the parallel gain); above it, worker processes win.
-PROCESS_THRESHOLD_BUSES = 40
+PROCESS_THRESHOLD_BUSES = 10
 
 
 def executor_for(config: Config) -> str:

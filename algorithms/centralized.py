@@ -1,207 +1,205 @@
 import time
+from typing import Dict
 import numpy as np
-import casadi as ca
+import cvxpy as cp
 from Config import Config
 from Trajectory import Trajectory
 from algorithms.base import SolveResult
-from algorithms.common import gen_alg_eqs, gen_discrete_step_foh, gen_coi_angle, DELTA_COI_MAX
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _build_constraints(config: Config) -> "tuple[list, Dict[str, cp.Variable]]":
+    """
+    Variables and constraints of the dynamic DC-OPF (see solve() for the full
+    formulation). Shared by solve() and check_feasible() so the two can never
+    drift apart: a config is feasible iff this constraint set is non-empty,
+    which is exactly what solve() requires to succeed.
+    """
+    N = config.N
+    dt = config.dt
+    n_buses = config.n_buses
+    n_gens = config.n_gens
+    n_loads = config.n_loads
+    n_thermal = config.n_thermal
+    n_battery = config.n_battery
+
+    # Bus index blocks: [gens | loads | thermal | batteries]
+    load_slice = slice(n_gens, n_gens + n_loads)
+    thermal_slice = slice(n_gens + n_loads, n_gens + n_loads + n_thermal)
+    battery_slice = slice(n_gens + n_loads + n_thermal, n_buses)
+
+    # DC power flow uses the susceptance Laplacian: P = B_dc theta with
+    # B_dc = -B, so the off-diagonal -b_ij matches the line flow expression below.
+    B_dc = -config.B
+
+    theta = cp.Variable((n_buses, N), name="theta")
+    P = cp.Variable((n_buses, N), name="P")
+    p_gen = cp.Variable((n_gens, N), name="p_gen")
+    p_thermal = cp.Variable((n_thermal, N), name="p_thermal")
+    p_batt = cp.Variable((n_battery, N), name="p_batt")
+    # States carry N+1 points so the terminal condition is expressible.
+    temp = cp.Variable((n_thermal, N + 1), name="temp")
+    soc = cp.Variable((n_battery, N + 1), name="soc")
+
+    constraints = [
+        theta[0, :] == 0,          # angle reference
+        P == B_dc @ theta,         # DC power flow
+        P[:n_gens, :] == p_gen,
+        P[load_slice, :] == -config.load_P,
+        P[thermal_slice, :] == -p_thermal,   # heating draws power from the bus
+        P[battery_slice, :] == p_batt,       # discharge positive
+    ]
+
+    # Generator capacity and ramping (ramp couples consecutive steps only).
+    constraints += [
+        p_gen >= config.gen_P_min[:, None],
+        p_gen <= config.gen_P_max[:, None],
+        cp.diff(p_gen, axis=1) >= config.gen_R_min[:, None],
+        cp.diff(p_gen, axis=1) <= config.gen_R_max[:, None],
+    ]
+
+    # Flexible-device power boxes.
+    constraints += [
+        p_thermal >= config.thermal_p_min[:, None],
+        p_thermal <= config.thermal_p_max[:, None],
+        p_batt >= config.battery_p_min[:, None],
+        p_batt <= config.battery_p_max[:, None],
+    ]
+
+    # Battery: SOC dynamics, bounds, initial and terminal conditions.
+    constraints += [
+        soc[:, 1:] == soc[:, :-1] - dt * p_batt,
+        soc >= config.battery_q_min[:, None],
+        soc <= config.battery_q_max[:, None],
+        soc[:, 0] == config.battery_q0,
+        soc[:, N] == config.battery_qT,
+    ]
+
+    # Thermal: first-order envelope dynamics and the comfort band. The band is
+    # imposed on the states the control can actually influence (t = 1..N), since
+    # temp[:, 0] is pinned to T0.
+    decay = 1.0 - config.thermal_mu / config.thermal_c
+    gain = config.thermal_eta / config.thermal_c
+    ambient = config.thermal_mu / config.thermal_c
+    constraints += [
+        temp[:, 1:] == (cp.multiply(decay[:, None], temp[:, :-1])
+                        + cp.multiply(gain[:, None], p_thermal)
+                        + cp.multiply(ambient[:, None], config.thermal_T_amb)),
+        temp[:, 0] == config.thermal_T0,
+        temp[:, 1:] >= config.thermal_T_min,
+        temp[:, 1:] <= config.thermal_T_max,
+    ]
+
+    # Line flows: f_ij = -B_ij (theta_i - theta_j) = b_ij (theta_i - theta_j).
+    for i, j in config.lines:
+        flow = -config.B[i, j] * (theta[i, :] - theta[j, :])
+        constraints.append(cp.abs(flow) <= config.line_flow_limits[i, j])
+
+    variables = {
+        "theta": theta, "P": P, "p_gen": p_gen,
+        "p_thermal": p_thermal, "p_batt": p_batt, "temp": temp, "soc": soc,
+    }
+    return constraints, variables
+
+
+def check_feasible(config: Config) -> bool:
+    """
+    True iff config's DC-OPF constraint set is non-empty: line limits,
+    generator/thermal/battery boxes and dynamics, ramping, and SOC/comfort
+    bounds are all jointly satisfiable. Solves the exact same constraints as
+    solve() against a zero objective, so this is precise (not a heuristic
+    approximation) and a feasible config is exactly one solve() will not
+    raise on.
+    """
+    constraints, _ = _build_constraints(config)
+    problem = cp.Problem(cp.Minimize(0), constraints)
+    problem.solve(solver=cp.CLARABEL)
+    return problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
 
 
 def solve(config: Config) -> SolveResult:
     """
-    Transient stability constrained OPF (TSC-OPF).
+    Centralized dynamic DC optimal power flow over a T-hour horizon.
 
-    Time step n = 0 is the pre-disturbance steady state and carries the usual
-    OPF constraints (P/Q limits, voltage bounds, line flows, slack reference).
-    The contingency is a bolted fault on config.fault_line, applied from n = 1
-    and cleared at config.t_clear by tripping that line, so the network
-    admittance follows config.Y_at(n). For n >= 1 the loads are constant
-    impedances folded into that admittance (a constant-power load cannot be
-    served at the depressed voltages of a fault), which is why the load buses
-    carry no device injection there. The generators follow the classical model
-    (see algorithms.common) discretized with the exact first-order hold. The
-    dispatch is required to keep |delta_i - delta_coi| <= 100 deg over the whole
-    horizon.
+    Solves one convex QP over all N = T/dt steps jointly (not a sequence of
+    single-period OPFs): the storage and thermal states couple the steps, so the
+    dispatch at t depends on the whole horizon.
 
-    The "omega" variable/trajectory key is the rotor speed deviation from
-    synchronous speed (omega_abs - omega_s, rad/s), so the steady state is 0.
+    Index layout: buses are ordered [generators | loads | thermal | batteries],
+    G = {0..n_g-1}, L, H and S the following blocks, V = G u L u H u S.
+
+        min_{p, theta, q, T}  sum_{t=0}^{N-1} sum_{i in G} alpha_i p_{i,t}^2 + beta_i p_{i,t}
+
+        s.t.  P_t = B theta_t,                               t = 0..N-1     (DC power flow)
+              theta_{0,t} = 0                                               (angle reference)
+              |B_ij (theta_{i,t} - theta_{j,t})| <= F_ij,     (i,j) in E     (line limits)
+
+              P_{i,t} = p_{i,t}            i in G                           (generation)
+              P_{i,t} = -P^load_{i,t}      i in L                           (fixed demand)
+              P_{i,t} = -p_{i,t}           i in H                           (thermal draw)
+              P_{i,t} = p_{i,t}            i in S                           (battery, discharge > 0)
+
+              P^min_i <= p_{i,t} <= P^max_i                   i in G        (capacity)
+              R^min_i <= p_{i,t+1} - p_{i,t} <= R^max_i       i in G        (ramping)
+
+              q_{i,t+1} = q_{i,t} - dt p_{i,t}                i in S        (SOC dynamics)
+              q^min_i <= q_{i,t} <= q^max_i,  q_{i,0} = q0_i,  q_{i,N} = qT_i
+              p^min_i <= p_{i,t} <= p^max_i                   i in S
+
+              T_{i,t+1} = (1 - mu_i/c_i) T_{i,t} + (eta_i/c_i) p_{i,t}
+                                          + (mu_i/c_i) Tamb_{i,t}   i in H  (thermal dynamics)
+              T^min_{i,t} <= T_{i,t} <= T^max_{i,t},  T_{i,0} = T0_i         (comfort band)
+              p^min_i <= p_{i,t} <= p^max_i                   i in H
+
+    Sign conventions: P is net injection, so load-like devices are negative. For
+    thermal units p > 0 heats, and the unit draws that power from its bus.
+
+    The objective is convex quadratic and every constraint is affine, so this is a
+    QP solved with CLARABEL via cvxpy; the returned point is a global optimum.
+    Convergence and residual fields of SolveResult are None, as they apply only to
+    the ADMM solvers.
     """
-    N = config.N
-    G = config.G
-    B = config.B
-    n_buses = config.n_buses
-    n_gens = config.n_gens
-    n_loads = config.n_loads
-    costs = config.costs
-    load_P = config.load_P
-    load_Q = config.load_Q
-    V_max = config.V_max
-    V_min = config.V_min
-    P_max = config.P_max
-    P_min = config.P_min
-    Q_max = config.Q_max
-    Q_min = config.Q_min
+    constraints, v = _build_constraints(config)
+    theta, P, p_gen = v["theta"], v["P"], v["p_gen"]
+    temp, soc = v["temp"], v["soc"]
+
+    cost = cp.sum(cp.multiply(config.gen_cost_alpha[:, None], cp.square(p_gen))
+                  + cp.multiply(config.gen_cost_beta[:, None], p_gen))
+
+    problem = cp.Problem(cp.Minimize(cost), constraints)
 
     start = time.perf_counter()
-
-    opti = ca.Opti()
-
-    V_re = opti.variable(n_buses, N)
-    V_im = opti.variable(n_buses, N)
-    I_re = opti.variable(n_buses, N)
-    I_im = opti.variable(n_buses, N)
-    P = opti.variable(n_buses, N)
-    Q = opti.variable(n_buses, N)
-
-    delta = opti.variable(n_gens, N)
-    omega = opti.variable(n_gens, N)
-    E = opti.variable(n_gens)  # voltage behind transient reactance (constant over the horizon)
-
-    opti.minimize(sum(costs[i] * P[i, 0]**2 for i in range(n_gens)))
-
-    for n in range(N):
-        # Network equations, with the admittance following the fault schedule:
-        # pre-fault at n = 0, loads folded in for n >= 1, post-fault (the
-        # faulted line tripped) after clearing. While the bolted fault is on,
-        # the faulted bus is pinned to V = 0 instead of its network row; its
-        # device current is then the generator's fault current, fixed by the
-        # rotor equation below.
-        Y_n = np.asarray(config.Y_at(n))
-        G_n, B_n = np.real(Y_n), np.imag(Y_n)
-        rows = config.network_buses_at(n)
-        net_re = G_n @ V_re[:, n] - B_n @ V_im[:, n]
-        net_im = B_n @ V_re[:, n] + G_n @ V_im[:, n]
-        opti.subject_to(I_re[rows, n] == net_re[rows])
-        opti.subject_to(I_im[rows, n] == net_im[rows])
-        if config.is_fault_step(n):
-            opti.subject_to(V_re[config.fault_bus, n] == 0)
-            opti.subject_to(V_im[config.fault_bus, n] == 0)
-
-        # Hyperbola constraints
-        for k in range(n_buses):
-            opti.subject_to(P[k, n] == V_re[k, n] * I_re[k, n] + V_im[k, n] * I_im[k, n])
-            opti.subject_to(Q[k, n] == V_im[k, n] * I_re[k, n] - V_re[k, n] * I_im[k, n])
-
-        # Load buses: constant power in the pre-disturbance steady state; for
-        # n >= 1 the load is a constant impedance inside Y_at(n), so the device
-        # itself injects nothing on top of the network.
-        for k in range(n_gens, n_gens + n_loads):
-            if n == 0:
-                opti.subject_to(P[k, n] == -load_P[k - n_gens])
-                opti.subject_to(Q[k, n] == -load_Q[k - n_gens])
-            else:
-                opti.subject_to(I_re[k, n] == 0)
-                opti.subject_to(I_im[k, n] == 0)
-
-        # Empty bus constraints
-        for k in range(n_gens + n_loads, n_buses):
-            opti.subject_to(I_re[k, n] == 0)
-            opti.subject_to(I_im[k, n] == 0)
-
-        # Generator algebraic equations: E e^{j delta} = V + j Xd I
-        for i in range(n_gens):
-            r = gen_alg_eqs(
-                config, i,
-                V_re[i, n], V_im[i, n], I_re[i, n], I_im[i, n],
-                P[i, n], Q[i, n], delta[i, n], omega[i, n], E[i], P[i, 0],
-            )
-            opti.subject_to(r["r_re"] == 0)
-            opti.subject_to(r["r_im"] == 0)
-
-        # Transient stability constraint: |delta_i - delta_coi| <= 100 deg
-        # (identically zero, hence skipped, with a single generator)
-        if n_gens > 1:
-            delta_coi = gen_coi_angle(config, delta[:, n])
-            for i in range(n_gens):
-                opti.subject_to(opti.bounded(-DELTA_COI_MAX, delta[i, n] - delta_coi, DELTA_COI_MAX))
-
-    # Generator differential equations (exact first-order hold: the electrical
-    # power is interpolated linearly across each step, which a fault transient
-    # needs at dt = 0.05 s). Mechanical power P_0 is the dispatch P[i, 0].
-    for n in range(N - 1):
-        for i in range(n_gens):
-            step = gen_discrete_step_foh(
-                config, i, delta[i, n], omega[i, n], P[i, n], P[i, n + 1], P[i, 0]
-            )
-            opti.subject_to(delta[i, n + 1] == step["delta_next"])
-            opti.subject_to(omega[i, n + 1] == step["omega_next"])
-
-    # Pre-disturbance steady state: zero speed deviation (delta[i, 0] follows
-    # from the algebraic equations)
-    for i in range(n_gens):
-        opti.subject_to(omega[i, 0] == 0)
-        opti.subject_to(E[i] >= 0)
-
-    # Reference (slack) bus angle: only for the steady state; afterwards the
-    # generator DAE fixes every angle in the synchronous frame.
-    opti.subject_to(V_im[0, 0] == 0)
-
-    # Voltage magnitude constraints (for n=0)
-    for k in range(n_buses):
-        V_sq = V_re[k, 0]**2 + V_im[k, 0]**2
-        opti.subject_to(V_sq >= V_min[k]**2)
-        opti.subject_to(V_sq <= V_max[k]**2)
-
-    # Power constraints (for n=0)
-    for i in range(n_gens):
-        opti.subject_to(P[i, 0] >= P_min[i])
-        opti.subject_to(P[i, 0] <= P_max[i])
-        opti.subject_to(Q[i, 0] >= Q_min[i])
-        opti.subject_to(Q[i, 0] <= Q_max[i])
-
-    # Line flow constraints (for n=0)
-    # TODO check where/when line flow constraints become active
-    for k in range(n_buses):
-        for l in range(k + 1, n_buses):
-            if G[k, l] == 0 and B[k, l] == 0:
-                continue  # no line between k and l
-            I_re_kl = -(V_re[k,0]-V_re[l,0])*G[k,l] + (V_im[k,0]-V_im[l,0])*B[k,l]
-            I_im_kl = -(V_re[k,0]-V_re[l,0])*B[k,l] - (V_im[k,0]-V_im[l,0])*G[k,l]
-            I_kl_sq = I_re_kl**2 + I_im_kl**2
-            opti.subject_to(I_kl_sq <= config.line_flow_limits**2)
-
-    opti.set_initial(V_re, np.ones((n_buses, N)))
-    opti.set_initial(V_im, np.zeros((n_buses, N)))
-    opti.set_initial(delta, np.zeros((n_gens, N)))
-    opti.set_initial(omega, np.zeros((n_gens, N)))
-    opti.set_initial(E, np.ones(n_gens))
-
-    opti.solver('ipopt', {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes'})
-
-    sol = opti.solve()
-
+    problem.solve(solver=cp.CLARABEL)
     runtime = time.perf_counter() - start
 
-    def val(x, shape):
-        return np.reshape(np.asarray(sol.value(x), dtype=float), shape)
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        raise RuntimeError(
+            f"Centralized dynamic OPF did not solve: status {problem.status!r}. "
+            "Check the config for an infeasible operating point (battery SOC "
+            "bounds vs battery_q0/battery_qT, thermal comfort band reachability "
+            "given thermal_eta/thermal_mu, and line_flow_limits vs peak demand)."
+        )
 
-    V_re_sol = val(V_re, (n_buses, N))
-    V_im_sol = val(V_im, (n_buses, N))
-    I_re_sol = val(I_re, (n_buses, N))
-    I_im_sol = val(I_im, (n_buses, N))
-    P_sol = val(P, (n_buses, N))
-    Q_sol = val(Q, (n_buses, N))
-    delta_sol = val(delta, (n_gens, N))
-    omega_sol = val(omega, (n_gens, N))
-    E_sol = val(E, (n_gens,))
-
-    dispatch = P_sol[:n_gens, 0]
-    obj = float(np.sum(costs * dispatch ** 2))
-
+    # States are solved on N+1 points. Store indices 1..N, the states the
+    # constraints govern, so stored index t is the state *at* step t and lines
+    # up with the per-step data (load_P, thermal_T_amb, the comfort band). Index
+    # 0 is the given initial condition and carries no decision.
     trajectory = Trajectory({
-        "v": (V_re_sol + 1j * V_im_sol).T,
-        "i": (I_re_sol + 1j * I_im_sol).T,
-        "s": (P_sol + 1j * Q_sol).T,
-        "delta": delta_sol.T,
-        "omega": omega_sol.T,
-        "E": np.tile(E_sol, (N, 1)),
+        "p": np.asarray(P.value).T,
+        "theta": np.asarray(theta.value).T,
+        "soc": np.asarray(soc.value)[:, 1:].T,
+        "temp": np.asarray(temp.value)[:, 1:].T,
     })
 
+    logger.info(f"Centralized finished with objective={problem.value}")
+
     return SolveResult(
-        dispatch=dispatch,
-        obj=obj,
+        trajectory=trajectory,
+        obj=float(problem.value), # type: ignore
         runtime=runtime,
         p_residual=None,
         s_residual=None,
-        trajectory=trajectory,
+        convergence=None,
     )

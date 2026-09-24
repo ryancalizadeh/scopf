@@ -2,26 +2,25 @@ from typing import Optional
 from Config import Config
 import numpy as np
 from dataclasses import dataclass
+from Trajectory import Trajectory
+from algorithms.base import ConvergenceHistory
 
 
 @dataclass
 class ExperimentResult:
     config: Config
     algorithm: str
-    dispatch: np.ndarray
+    trajectory: Trajectory
     obj: float
     runtime: float
     p_residual: Optional[float]
     s_residual: Optional[float]
-    # Reactive dispatch Q(0) at the generator buses (same order as dispatch).
-    # Together with dispatch it fixes the pre-disturbance operating point, so
-    # plot_dynamics.py can re-simulate the transient from the stored results.
-    dispatch_Q: Optional[np.ndarray] = None
+    convergence: Optional[ConvergenceHistory]
 
     def __eq__(self, other):
         if not isinstance(other, ExperimentResult):
             return NotImplemented
-        return (self.dispatch == other.dispatch).all()
+        return (self.trajectory - other.trajectory).norm() < 1e-6 and abs(self.obj - other.obj) < 1e-6
 
 
 @dataclass
@@ -33,7 +32,6 @@ class AggregatedResult:
     obj_std: float
     p_residual_mean: Optional[float]
     s_residual_mean: Optional[float]
-    dispatch_ref: np.ndarray
 
 
 def aggregate(results: list[ExperimentResult]) -> AggregatedResult:
@@ -55,5 +53,4 @@ def aggregate(results: list[ExperimentResult]) -> AggregatedResult:
         obj_std=float(np.std(objs)),
         p_residual_mean=float(np.mean(p_residuals)) if p_residuals else None,
         s_residual_mean=float(np.mean(s_residuals)) if s_residuals else None,
-        dispatch_ref=results[0].dispatch,
     )
