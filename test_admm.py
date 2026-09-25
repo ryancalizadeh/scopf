@@ -20,7 +20,7 @@ from Config import Config
 from Trajectory import Trajectory
 from algorithms import centralized, admm_vanilla
 from algorithms.common import (Network, Generator, Load, Battery, Thermal,
-                               make_bus_behaviour, check_solution, thermal_shift)
+                               make_bus_behaviour, check_solution, to_centralized_layout)
 from test_centralized import check_solution as check_centralized
 
 
@@ -137,20 +137,6 @@ def test_devices(config: Config) -> None:
     assert worst < 1e-6, f"device constraints violated after one g pass: {worst:.2e}"
     print(f"  n={config.n_buses}: {n_gens} gen, {n_loads} load, {n_thermal} thermal, "
           f"{config.n_battery} battery proxes agree with references; worst device violation {worst:.1e}")
-
-
-def to_centralized_layout(config: Config, z: Trajectory) -> Trajectory:
-    """Repacks the ADMM trajectory into the width layout of centralized.solve."""
-    n_gens, n_loads, n_thermal = config.n_gens, config.n_loads, config.n_thermal
-    thermal_cols = slice(n_gens + n_loads, n_gens + n_loads + n_thermal)
-    battery_cols = slice(n_gens + n_loads + n_thermal, config.n_buses)
-    shift = thermal_shift(config)
-    return Trajectory({
-        "p": z["p"].copy(),
-        "theta": z["theta"].copy(),
-        "soc": z["soc"][:, battery_cols].copy(),
-        "temp": (z["temp"] + shift)[:, thermal_cols],
-    })
 
 
 def test_integration(n_buses: int, obj_tol: float = 1e-3, gen_tol: float = 1e-2, **kwargs) -> Trajectory:

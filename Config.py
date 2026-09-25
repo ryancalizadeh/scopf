@@ -1,5 +1,39 @@
+import copy
 import numpy as np
 from Trajectory import Trajectory
+
+
+# Daily profiles as functions of hour of day, periodic in 24 h so the same
+# shapes extend past midnight into the lookahead (see Config.T_lookahead).
+
+def _daily_load_shape(hours: np.ndarray) -> np.ndarray:
+    """Unnormalized demand shape: overnight minimum, morning ramp, evening peak."""
+    h = np.mod(hours, 24.0)
+    return (
+        0.62
+        + 0.16 * np.exp(-0.5 * ((h - 8.0) / 2.0) ** 2)
+        + 0.30 * np.exp(-0.5 * ((h - 19.0) / 3.0) ** 2)
+    )
+
+
+def _daily_ambient(hours: np.ndarray, T_amb_low: float, T_amb_high: float) -> np.ndarray:
+    """Diurnal cycle troughing near 5am at T_amb_low and peaking near 3pm at T_amb_high."""
+    T_amb_mean = 0.5 * (T_amb_low + T_amb_high)
+    T_amb_amp = 0.5 * (T_amb_high - T_amb_low)
+    return T_amb_mean - T_amb_amp * np.cos(2 * np.pi * (hours - 5.0) / 24.0)
+
+
+def _comfort_band(hours: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    """[T_min, T_max] profile: tight [20, 23] C while occupied (8am-5pm), setback [12, 28] C otherwise."""
+    h = np.mod(hours, 24.0)
+    occupied = (h >= 8.0) & (h < 17.0)
+    return np.where(occupied, 20.0, 12.0), np.where(occupied, 23.0, 28.0)
+
+
+def _smooth(noise: np.ndarray) -> np.ndarray:
+    """3-tap circular moving average along time, to avoid unrealistic rapid changes."""
+    return (noise + np.roll(noise, 1, axis=1) + np.roll(noise, -1, axis=1)) / 3.0
+
 
 class Config:
     """
@@ -42,6 +76,18 @@ class Config:
     - thermal_T0: Initial temperature of each thermal bus.
     - thermal_p_min: Minimum control power for thermal units.
     - thermal_p_max: Maximum control power for thermal units.
+    - gen_p_prev: Generator output applied at the step before the horizon, or
+      None. When set, the first step's ramp is constrained against it (the
+      anchor a receding-horizon window needs; see window()).
+
+    Lookahead data, for receding-horizon control whose window runs past T:
+
+    - T_lookahead: Hours of time-series data generated beyond T (default 0).
+    - n_lookahead: int(T_lookahead / dt) extra steps.
+    - load_P_ext, thermal_T_amb_ext, thermal_T_min_ext, thermal_T_max_ext:
+      The time series over N + n_lookahead steps. The first N columns equal
+      load_P, thermal_T_amb, thermal_T_min and thermal_T_max exactly; the
+      daily shapes repeat past midnight with fresh noise.
     """
     T: float # by default 24 hours, from midnight to midnight
     dt: float # by default 15 minutes (0.25 hours)
@@ -87,13 +133,17 @@ class Config:
                  battery_ratio: float = 0.25,
                  T: float = 24,
                  dt: float = 0.25,
-                 seed: int = 42
+                 seed: int = 42,
+                 T_lookahead: float = 0.0,
                 ):
         self.seed = seed
         rng = np.random.default_rng(seed=self.seed)
         self.T = T
         self.dt = dt
         self.N = int(T / dt)
+        self.T_lookahead = T_lookahead
+        self.n_lookahead = int(T_lookahead / dt)
+        self.gen_p_prev = None
 
         assert np.isclose(
             gen_ratio + load_ratio + thermal_ratio + battery_ratio, 1.0
@@ -135,19 +185,14 @@ class Config:
         # evening peak.  Each load receives a distinct scale and a small,
         # smooth random perturbation while remaining positive in p.u.
         hours = np.arange(self.N) * self.dt
-        daily_shape = (
-            0.62
-            + 0.16 * np.exp(-0.5 * ((hours - 8.0) / 2.0) ** 2)
-            + 0.30 * np.exp(-0.5 * ((hours - 19.0) / 3.0) ** 2)
-        )
-        daily_shape /= daily_shape.mean()
+        daily_shape = _daily_load_shape(hours)
+        shape_mean = daily_shape.mean()
+        daily_shape /= shape_mean
 
+        load_scales = np.empty((0, 1))
         if self.n_loads:
             load_scales = rng.uniform(0.7, 1.1, self.n_loads)[:, None]
-            noise = rng.normal(0.0, 0.025, (self.n_loads, self.N))
-            # Smooth the independent noise to avoid unrealistic rapid changes.
-            noise = (noise + np.roll(noise, 1, axis=1) +
-                     np.roll(noise, -1, axis=1)) / 3.0
+            noise = _smooth(rng.normal(0.0, 0.025, (self.n_loads, self.N)))
             self.load_P = np.maximum(
                 0.05, load_scales * daily_shape[None, :] * (1.0 + noise)
             )
@@ -189,17 +234,10 @@ class Config:
         # spatially correlated but not identical across buses).
         T_amb_low = 8.0
         T_amb_high = 15.0
-        T_amb_mean = 0.5 * (T_amb_low + T_amb_high)
-        T_amb_amp = 0.5 * (T_amb_high - T_amb_low)
-        # Diurnal cycle troughs near 5am and peaks near 15:00 (3pm).
-        daily_T_amb = T_amb_mean - T_amb_amp * np.cos(
-            2 * np.pi * (hours - 5.0) / 24.0
-        )
+        daily_T_amb = _daily_ambient(hours, T_amb_low, T_amb_high)
 
         if self.n_thermal:
-            amb_noise = rng.normal(0.0, 0.3, (self.n_thermal, self.N))
-            amb_noise = (amb_noise + np.roll(amb_noise, 1, axis=1) +
-                         np.roll(amb_noise, -1, axis=1)) / 3.0
+            amb_noise = _smooth(rng.normal(0.0, 0.3, (self.n_thermal, self.N)))
             self.thermal_T_amb = daily_T_amb[None, :] + amb_noise
         else:
             self.thermal_T_amb = np.empty((0, self.N))
@@ -207,9 +245,7 @@ class Config:
         # Comfort deadbands: buildings occupied 8am-5pm, held tightly to
         # [20, 23] C during those hours; outside occupied hours the deadband
         # relaxes to a wide setback [12, 28] C so temperature can drift.
-        occupied = (hours >= 8.0) & (hours < 17.0)
-        T_min_profile = np.where(occupied, 20.0, 12.0)
-        T_max_profile = np.where(occupied, 23.0, 28.0)
+        T_min_profile, T_max_profile = _comfort_band(hours)
 
         self.thermal_T_min = np.tile(T_min_profile, (self.n_thermal, 1))
         self.thermal_T_max = np.tile(T_max_profile, (self.n_thermal, 1))
@@ -217,6 +253,29 @@ class Config:
         self.thermal_T0 = np.full(self.n_thermal, 21.0)
         self.thermal_p_min = np.zeros(self.n_thermal)
         self.thermal_p_max = np.ones(self.n_thermal)
+
+        # Lookahead past T: the same daily shapes continued past midnight, with
+        # noise from a separate stream so that adding a lookahead never changes
+        # the draws above (a seed's day-1 data is the same for every T_lookahead).
+        # Each block's noise is smoothed on its own, so there is a small seam at
+        # the day boundary.
+        ext_rng = np.random.default_rng([seed, 1])
+        ext_hours = np.arange(self.N, self.N + self.n_lookahead) * self.dt
+        ext_load_noise = _smooth(ext_rng.normal(0.0, 0.025, (self.n_loads, self.n_lookahead)))
+        ext_amb_noise = _smooth(ext_rng.normal(0.0, 0.3, (self.n_thermal, self.n_lookahead)))
+        ext_T_min, ext_T_max = _comfort_band(ext_hours)
+        ext_shape = _daily_load_shape(ext_hours) / shape_mean
+
+        self.load_P_ext = np.hstack([
+            self.load_P,
+            np.maximum(0.05, load_scales * ext_shape[None, :] * (1.0 + ext_load_noise)),
+        ])
+        self.thermal_T_amb_ext = np.hstack([
+            self.thermal_T_amb,
+            _daily_ambient(ext_hours, T_amb_low, T_amb_high)[None, :] + ext_amb_noise,
+        ])
+        self.thermal_T_min_ext = np.hstack([self.thermal_T_min, np.tile(ext_T_min, (self.n_thermal, 1))])
+        self.thermal_T_max_ext = np.hstack([self.thermal_T_max, np.tile(ext_T_max, (self.n_thermal, 1))])
 
         # Line limits, sized now that the devices are sized. A flat 1.0 p.u. is
         # far too tight: the network must route the fixed load plus thermal
@@ -263,6 +322,40 @@ class Config:
             "soc": soc,
             "temp": np.zeros((N, n)),
         })
+
+    def window(self, start: int, length: int, soc0: np.ndarray, temp0: np.ndarray,
+               p_gen_prev: "np.ndarray | None" = None) -> "Config":
+        """
+        The problem over steps [start, start + length), as a Config any solver
+        takes unchanged: the time series are sliced from the *_ext arrays, the
+        initial states are replaced by the measured ones, and the first step's
+        ramp is anchored at p_gen_prev (None: unanchored). battery_qT is kept,
+        so the SOC terminal condition sits at the end of the window.
+
+        soc0 is the SOC of each battery and temp0 the absolute temperature of
+        each thermal unit before step start (the state after step start - 1).
+        The window is self-contained (no lookahead of its own), and shares the
+        network and device parameters with this config.
+        """
+        stop = start + length
+        if start < 0 or length < 1 or stop > self.N + self.n_lookahead:
+            raise ValueError(
+                f"window [{start}, {stop}) is outside the {self.N + self.n_lookahead} steps of data "
+                f"(N={self.N}, n_lookahead={self.n_lookahead}); raise T_lookahead"
+            )
+        w = copy.copy(self)
+        w.N = length
+        w.T = length * self.dt
+        w.T_lookahead = 0.0
+        w.n_lookahead = 0
+        w.load_P = w.load_P_ext = self.load_P_ext[:, start:stop]
+        w.thermal_T_amb = w.thermal_T_amb_ext = self.thermal_T_amb_ext[:, start:stop]
+        w.thermal_T_min = w.thermal_T_min_ext = self.thermal_T_min_ext[:, start:stop]
+        w.thermal_T_max = w.thermal_T_max_ext = self.thermal_T_max_ext[:, start:stop]
+        w.battery_q0 = np.array(soc0, dtype=float).reshape(self.n_battery)
+        w.thermal_T0 = np.array(temp0, dtype=float).reshape(self.n_thermal)
+        w.gen_p_prev = None if p_gen_prev is None else np.array(p_gen_prev, dtype=float).reshape(self.n_gens)
+        return w
 
     def generate_Y_bus(self, avg_degree: float):
         # TODO For now this is fine. In the future, I should follow the methodology of Birchfield 2017

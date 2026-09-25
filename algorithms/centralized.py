@@ -56,9 +56,19 @@ def _build_constraints(config: Config) -> "tuple[list, Dict[str, cp.Variable]]":
     constraints += [
         p_gen >= config.gen_P_min[:, None],
         p_gen <= config.gen_P_max[:, None],
-        cp.diff(p_gen, axis=1) >= config.gen_R_min[:, None],
-        cp.diff(p_gen, axis=1) <= config.gen_R_max[:, None],
     ]
+    if N > 1:  # a one-step horizon (end of a shrinking window) has no internal ramp
+        constraints += [
+            cp.diff(p_gen, axis=1) >= config.gen_R_min[:, None],
+            cp.diff(p_gen, axis=1) <= config.gen_R_max[:, None],
+        ]
+    # Ramp into the horizon from the output applied just before it (receding
+    # horizon; see Config.window). Unanchored when there is no such step.
+    if config.gen_p_prev is not None and n_gens:
+        constraints += [
+            p_gen[:, 0] - config.gen_p_prev >= config.gen_R_min,
+            p_gen[:, 0] - config.gen_p_prev <= config.gen_R_max,
+        ]
 
     # Flexible-device power boxes.
     constraints += [
@@ -143,6 +153,7 @@ def solve(config: Config) -> SolveResult:
 
               P^min_i <= p_{i,t} <= P^max_i                   i in G        (capacity)
               R^min_i <= p_{i,t+1} - p_{i,t} <= R^max_i       i in G        (ramping)
+              R^min_i <= p_{i,0} - p^prev_i <= R^max_i        i in G        (only if gen_p_prev is set)
 
               q_{i,t+1} = q_{i,t} - dt p_{i,t}                i in S        (SOC dynamics)
               q^min_i <= q_{i,t} <= q^max_i,  q_{i,0} = q0_i,  q_{i,N} = qT_i

@@ -137,9 +137,14 @@ class Generator(Proxable):
         constraints = [
             p >= config.gen_P_min[k],
             p <= config.gen_P_max[k],
-            cp.diff(p) >= config.gen_R_min[k],
-            cp.diff(p) <= config.gen_R_max[k],
         ]
+        if N > 1:
+            constraints += [cp.diff(p) >= config.gen_R_min[k], cp.diff(p) <= config.gen_R_max[k]]
+        # Ramp into the horizon from the output applied just before it (see
+        # Config.window). A constant, since the prox is built per config.
+        if config.gen_p_prev is not None:
+            p_prev = float(config.gen_p_prev[k])
+            constraints += [p[0] - p_prev >= config.gen_R_min[k], p[0] - p_prev <= config.gen_R_max[k]]
         self._p = p
         self._prob = cp.Problem(cp.Minimize(objective), constraints)
         assert self._prob.is_dpp()
@@ -623,6 +628,28 @@ def make_bus_behaviours(config: Config, parallel: "bool | str" = False, n_worker
     raise ValueError(f"unknown parallel mode {parallel!r}; use False, True, 'sequential', 'threads' or 'processes'")
 
 
+def to_centralized_layout(config: Config, z: Trajectory) -> Trajectory:
+    """
+    Repacks a trajectory in the base-trajectory layout of the ADMM solvers
+    (every key n_buses wide, temp shifted by thermal_T0) into the layout of
+    centralized.solve: soc one column per battery, temp one column per thermal
+    unit in degrees C. A trajectory already in the centralized layout is
+    returned as a copy.
+    """
+    if z.width("soc") == config.n_battery and z.width("temp") == config.n_thermal:
+        return z.copy()
+    n_gens, n_loads, n_thermal = config.n_gens, config.n_loads, config.n_thermal
+    thermal_cols = slice(n_gens + n_loads, n_gens + n_loads + n_thermal)
+    battery_cols = slice(n_gens + n_loads + n_thermal, config.n_buses)
+    shift = thermal_shift(config)
+    return Trajectory({
+        "p": z["p"].copy(),
+        "theta": z["theta"].copy(),
+        "soc": z["soc"][:, battery_cols].copy(),
+        "temp": (z["temp"] + shift)[:, thermal_cols],
+    })
+
+
 def _excess(values: np.ndarray, lower, upper) -> float:
     """Largest amount by which values leave [lower, upper]; 0.0 when inside."""
     if values.size == 0:
@@ -665,7 +692,10 @@ def check_solution(z: Trajectory, config: Config) -> Dict[str, float]:
 
     # Generators: capacity and ramping.
     checks["gen_capacity"] = _excess(p_gen, config.gen_P_min, config.gen_P_max)
-    checks["gen_ramp"] = _excess(np.diff(p_gen, axis=0), config.gen_R_min, config.gen_R_max)
+    ramps = np.diff(p_gen, axis=0)
+    if config.gen_p_prev is not None:
+        ramps = np.vstack([p_gen[:1] - config.gen_p_prev, ramps])
+    checks["gen_ramp"] = _excess(ramps, config.gen_R_min, config.gen_R_max)
 
     # Fixed loads served exactly.
     checks["load_mismatch"] = _mismatch(-p[:, load_cols], config.load_P.T)
