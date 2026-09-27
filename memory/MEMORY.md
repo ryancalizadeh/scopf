@@ -1,0 +1,3 @@
+- [rho schedule preference](rho-schedule-preference.md) — user chose fixed rho=2 for the DC-OPF ADMM (2026-09-21); ramp + |dz| rule rejected on theory; balancing fails at n=45; old ramp preference was for the nuked TSCOPF problem
+- [Working feedback style](working-feedback-style.md) — user wants running narration: what's being checked, what broke, what was tried, how it went
+- [n=45 binding-line oscillation](n45-binding-line-oscillation.md) — n=45 slow because line (26,34) is a bridge into a rigid pocket (2 loads + 3 thermals) rationed at pre-heat; coupling across g-blocks enforced only via prices, thermals inelastic → slow price loop; NOT flat directions; balancing false-triggers there
