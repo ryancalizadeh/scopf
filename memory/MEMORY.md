@@ -1,3 +1,10 @@
 - [rho schedule preference](rho-schedule-preference.md) — user chose fixed rho=2 for the DC-OPF ADMM (2026-09-21); ramp + |dz| rule rejected on theory; balancing fails at n=45; old ramp preference was for the nuked TSCOPF problem
 - [Working feedback style](working-feedback-style.md) — user wants running narration: what's being checked, what broke, what was tried, how it went
 - [n=45 binding-line oscillation](n45-binding-line-oscillation.md) — n=45 slow because line (26,34) is a bridge into a rigid pocket (2 loads + 3 thermals) rationed at pre-heat; coupling across g-blocks enforced only via prices, thermals inelastic → slow price loop; NOT flat directions; balancing false-triggers there
+- [ADMM vs binding lines](admm-binding-lines-scaling.md) — n=20 sweep 2026-09-25: iterations do not scale with #binding lines; step at first meshed line, radial generator bridges free, humps near binding-set changes
+- [DOPF config feasibility](dopf-config-feasibility.md) — battery_q0, thermal_eta (x4), line_flow_limits must stay tuned or the dynamic OPF is infeasible; verified n_buses 5-105; n=500 seed 7 infeasible
+- [DOPF thermal sign](dopf-thermal-sign.md) — p>0 heats (flipped 2026-09-18); state trajectories store indices 1..N so index t is the state at step t
+- [MPC closed loop](mpc-closed-loop.md) — run_mpc.py built 2026-09-24; roadmap: soft constraints next, then nonlinear plant; read rolling-H cost gap with midnight SOC
+- [casadi thread affinity](casadi-thread-affinity.md) — Opti/IPOPT crashes if solved from changing threads; thread executor pins buses, process executor (default for admm_parallel) sidesteps it; timing table inside
+- [ADMM voltage-bound stall](admm-voltage-bound-stall.md) — HISTORY (AC TSCOPF): ADMM stalled when the optimum sat on V_max, a constraint only one side of the split saw
+- [Random configs infeasible](random-configs-infeasible.md) — HISTORY (AC TSCOPF): generator was statically infeasible, fixed 2026-09-06; superseded by dopf-config-feasibility
