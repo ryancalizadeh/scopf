@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def solve(config: Config, parallel: "bool | str" = False, *,
-          rho: Optional[Callable] = None, max_iterations: int = 1000) -> SolveResult:
+          rho: Optional[Callable] = None, max_iterations: int = 1000,
+          callback: Optional[Callable] = None) -> SolveResult:
     """
     Dynamic DC-OPF of centralized.py by ADMM, split as
         f = Network        (DC power flow + line limits, one projection per iteration)
@@ -22,6 +23,8 @@ def solve(config: Config, parallel: "bool | str" = False, *,
     False / "sequential", True / "threads", or "processes".
     rho is a schedule (iteration, rho_prev, r, s) -> rho; default a fixed 2.0
     (see common.rho_fixed for the comparison against the adaptive schedules).
+    callback is passed to admm(): callback(iteration, x, z, u, r, s) after
+    every iteration, x being the Network projection.
 
     Returns the last z, which satisfies every device constraint exactly and the
     network constraints to within the primal residual, so the reported
@@ -39,7 +42,7 @@ def solve(config: Config, parallel: "bool | str" = False, *,
     try:
         xs, zs, us, rs, ss, rhos = admm(
             f, g, z0, rho=rho or rho_fixed(2.0), threshold=threshold,
-            max_iterations=max_iterations,
+            max_iterations=max_iterations, callback=callback,
         )
     finally:
         # Worker processes/threads of the parallel executors are released here
